@@ -15,8 +15,6 @@ class PhongBsdf : public Bsdf
     float _brdfFactor;
     float _diffuseRatio;
 
-    void init();
-
 public:
     PhongBsdf(float exponent = 64.0f, float diffuseRatio = 0.2f);
 
@@ -27,9 +25,26 @@ public:
     virtual Vec3f eval(const SurfaceScatterEvent &event) const override;
     virtual float pdf(const SurfaceScatterEvent &event) const override;
 
+    virtual void prepareForRender() override;
+
     float exponent() const
     {
         return _exponent;
+    }
+
+    float diffuseRatio() const
+    {
+        return _diffuseRatio;
+    }
+
+    void setDiffuseRatio(float diffuseRatio)
+    {
+        _diffuseRatio = diffuseRatio;
+    }
+
+    void setExponent(float exponent)
+    {
+        _exponent = exponent;
     }
 };
 

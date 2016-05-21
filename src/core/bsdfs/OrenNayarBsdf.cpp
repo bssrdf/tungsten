@@ -4,16 +4,14 @@
 
 #include "materials/ConstantTexture.hpp"
 
-#include "sampling/SampleGenerator.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 #include "sampling/SampleWarp.hpp"
 
 #include "math/Angle.hpp"
 #include "math/Vec.hpp"
 
-#include "io/JsonUtils.hpp"
+#include "io/JsonObject.hpp"
 #include "io/Scene.hpp"
-
-#include <rapidjson/document.h>
 
 namespace Tungsten {
 
@@ -32,10 +30,10 @@ void OrenNayarBsdf::fromJson(const rapidjson::Value &v, const Scene &scene)
 
 rapidjson::Value OrenNayarBsdf::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Bsdf::toJson(allocator);
-    v.AddMember("type", "oren_nayar", allocator);
-    JsonUtils::addObjectMember(v, "roughness", *_roughness, allocator);
-    return std::move(v);
+    return JsonObject{Bsdf::toJson(allocator), allocator,
+        "type", "oren_nayar",
+        "roughness", *_roughness
+    };
 }
 
 
@@ -46,15 +44,15 @@ bool OrenNayarBsdf::sample(SurfaceScatterEvent &event) const
     if (event.wi.z() <= 0.0f)
         return false;
 
-    float roughness = (*_roughness)[event.info->uv].x();
+    float roughness = (*_roughness)[*event.info].x();
     float ratio = clamp(roughness, 0.01f, 1.0f);
-    if (event.sampler->next1D() < ratio)
+    if (event.sampler->nextBoolean(ratio))
         event.wo  = SampleWarp::uniformHemisphere(event.sampler->next2D());
     else
         event.wo  = SampleWarp::cosineHemisphere(event.sampler->next2D());
 
     event.pdf = SampleWarp::uniformHemispherePdf(event.wo)*ratio + SampleWarp::cosineHemispherePdf(event.wo)*(1.0f - ratio);
-    event.throughput = eval(event)/event.pdf;
+    event.weight = eval(event)/event.pdf;
     event.sampledLobe = BsdfLobes::DiffuseReflectionLobe;
     return event.wo.z() > 0.0f;
 }
@@ -82,7 +80,7 @@ Vec3f OrenNayarBsdf::eval(const SurfaceScatterEvent &event) const
         cosDeltaPhi = (wi.x()*wo.x() + wi.y()*wo.y())/std::sqrt(denom);
 
     const float RoughnessToSigma = 1.0f/std::sqrt(2.0f);
-    float sigma = RoughnessToSigma*(*_roughness)[event.info->uv].x();
+    float sigma = RoughnessToSigma*(*_roughness)[*event.info].x();
     float sigmaSq = sigma*sigma;
 
     float C1 = 1.0f - 0.5f*sigmaSq/(sigmaSq + 0.33f);
@@ -107,7 +105,7 @@ float OrenNayarBsdf::pdf(const SurfaceScatterEvent &event) const
     if (event.wi.z() <= 0.0f || event.wo.z() <= 0.0f)
         return 0.0f;
 
-    float roughness = (*_roughness)[event.info->uv].x();
+    float roughness = (*_roughness)[*event.info].x();
     float ratio = clamp(roughness, 0.01f, 1.0f);
     return SampleWarp::uniformHemispherePdf(event.wo)*ratio + SampleWarp::cosineHemispherePdf(event.wo)*(1.0f - ratio);
 }

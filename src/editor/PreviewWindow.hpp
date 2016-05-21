@@ -4,17 +4,17 @@
 #include "CameraControls.hpp"
 #include "TransformGizmo.hpp"
 
-#include "render/BufferObject.hpp"
-#include "render/VertexBuffer.hpp"
-#include "render/RenderTarget.hpp"
-#include "render/Texture.hpp"
-#include "render/Shader.hpp"
+#include "opengl/BufferObject.hpp"
+#include "opengl/VertexBuffer.hpp"
+#include "opengl/RenderTarget.hpp"
+#include "opengl/Texture.hpp"
+#include "opengl/Shader.hpp"
 
 #include "math/Vec.hpp"
 
 #include <unordered_map>
 #include <unordered_set>
-#include <QGLWidget>
+#include <QOpenGLWidget>
 #include <memory>
 
 class QStatusBar;
@@ -50,21 +50,20 @@ public:
     void draw(GL::Shader &shader);
 };
 
-class PreviewWindow : public QGLWidget
+enum MouseConsumers
+{
+    CameraConsumer    = (1 << 0),
+    GizmoConsumer     = (1 << 1),
+    SelectionConsumer = (1 << 2),
+};
+
+class PreviewWindow : public QOpenGLWidget
 {
     Q_OBJECT
 
-    static CONSTEXPR float Fov  = 60.0f;
-    static CONSTEXPR float Near = 0.01f;
-    static CONSTEXPR float Far  = 100.0f;
-
-    enum MouseConsumers
-    {
-        CameraConsumer    = (1 << 0),
-        GizmoConsumer     = (1 << 1),
-        SelectionConsumer = (1 << 2),
-    };
-    const std::array<MouseConsumers, 3> DefaultPriorities{{GizmoConsumer, CameraConsumer, SelectionConsumer}};
+    const float Fov  = 60.0f;
+    const float Near = 0.01f;
+    const float Far  = 100.0f;
 
     struct SelectionState
     {
@@ -95,16 +94,13 @@ class PreviewWindow : public QGLWidget
     std::unique_ptr<GL::Shader> _shader, _wireframeShader, _solidShader;
 
     SelectionState _selectionState;
-    std::unordered_set<Primitive *> _selection;
+    std::unordered_set<Primitive *> &_selection;
 
     std::array<MouseConsumers, 3> _mousePriorities;
 
     bool _rebuildMeshes;
 
-    Mat4f projection() const
-    {
-        return Mat4f::perspective(Fov, width()/float(height()), Near, Far);
-    }
+    Mat4f projection() const;
 
     void rebuildMeshMap();
     bool updateViewTransform(QMouseEvent *event);
@@ -117,6 +113,9 @@ class PreviewWindow : public QGLWidget
     bool handleSelection(QMouseEvent *event);
 
     bool handleMouse(QMouseEvent *event);
+
+    void drawBackgroundGradient();
+    void drawGrid();
 
 private slots:
     void toggleSelectAll();
@@ -146,9 +145,14 @@ protected:
 
 public slots:
     void sceneChanged();
+    void changeSelection();
+
+signals:
+    void selectionChanged();
+    void primitiveListChanged();
 
 public:
-    PreviewWindow(QWidget *proxyParent, MainWindow *parent, const QGLFormat &format);
+    PreviewWindow(QWidget *proxyParent, MainWindow *parent);
 
     void addStatusWidgets(QStatusBar *statusBar);
     void saveSceneData();

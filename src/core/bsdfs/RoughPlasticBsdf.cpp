@@ -6,38 +6,25 @@
 
 #include "materials/ConstantTexture.hpp"
 
-#include "sampling/SampleGenerator.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 #include "sampling/SampleWarp.hpp"
 
 #include "math/MathUtil.hpp"
 #include "math/Angle.hpp"
 #include "math/Vec.hpp"
 
-#include "io/JsonUtils.hpp"
+#include "io/JsonObject.hpp"
 #include "io/Scene.hpp"
-
-#include <rapidjson/document.h>
 
 namespace Tungsten {
 
-void RoughPlasticBsdf::init()
-{
-    _scaledSigmaA = _thickness*_sigmaA;
-    _avgTransmittance = std::exp(-2.0f*_scaledSigmaA.avg());
-
-    _distribution = Microfacet::stringToType(_distributionName);
-
-    _diffuseFresnel = Fresnel::computeDiffuseFresnel(_ior, 1000000);
-}
-
 RoughPlasticBsdf::RoughPlasticBsdf()
 : _ior(1.5f),
-  _thickness(0.0f),
+  _thickness(1.0f),
   _sigmaA(0.0f),
   _distributionName("ggx"),
   _roughness(std::make_shared<ConstantTexture>(0.02f))
 {
-    init();
     _lobes = BsdfLobes(BsdfLobes::GlossyReflectionLobe | BsdfLobes::DiffuseReflectionLobe);
 }
 
@@ -47,22 +34,23 @@ void RoughPlasticBsdf::fromJson(const rapidjson::Value &v, const Scene &scene)
     JsonUtils::fromJson(v, "ior", _ior);
     JsonUtils::fromJson(v, "distribution", _distributionName);
     JsonUtils::fromJson(v, "thickness", _thickness);
-    JsonUtils::fromJson(v, "sigmaA", _sigmaA);
+    JsonUtils::fromJson(v, "sigma_a", _sigmaA);
     scene.textureFromJsonMember(v, "roughness", TexelConversion::REQUEST_AVERAGE, _roughness);
 
-    init();
+    // Fail early in case of invalid distribution name
+    prepareForRender();
 }
 
 rapidjson::Value RoughPlasticBsdf::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Bsdf::toJson(allocator);
-    v.AddMember("type", "rough_plastic", allocator);
-    v.AddMember("ior", _ior, allocator);
-    v.AddMember("thickness", _thickness, allocator);
-    v.AddMember("sigmaA", JsonUtils::toJsonValue(_sigmaA, allocator), allocator);
-    v.AddMember("distribution", _distributionName.c_str(), allocator);
-    JsonUtils::addObjectMember(v, "roughness", *_roughness, allocator);
-    return std::move(v);
+    return JsonObject{Bsdf::toJson(allocator), allocator,
+        "type", "rough_plastic",
+        "ior", _ior,
+        "thickness", _thickness,
+        "sigma_a", _sigmaA,
+        "distribution", _distributionName,
+        "roughness", *_roughness
+    };
 }
 
 bool RoughPlasticBsdf::sample(SurfaceScatterEvent &event) const
@@ -83,8 +71,8 @@ bool RoughPlasticBsdf::sample(SurfaceScatterEvent &event) const
     float specularWeight = Fi;
     float specularProbability = specularWeight/(specularWeight + substrateWeight);
 
-    if (sampleR && (event.sampler->next1D() < specularProbability || !sampleT)) {
-        float roughness = (*_roughness)[event.info->uv].x();
+    if (sampleR && (event.sampler->nextBoolean(specularProbability) || !sampleT)) {
+        float roughness = (*_roughness)[*event.info].x();
         if (!RoughDielectricBsdf::sampleBase(event, true, false, roughness, _ior, _distribution))
             return false;
         if (sampleT) {
@@ -92,11 +80,11 @@ bool RoughPlasticBsdf::sample(SurfaceScatterEvent &event) const
             float Fo = Fresnel::dielectricReflectance(eta, event.wo.z());
 
             Vec3f brdfSubstrate = ((1.0f - Fi)*(1.0f - Fo)*eta*eta)*(diffuseAlbedo/(1.0f - diffuseAlbedo*_diffuseFresnel))*INV_PI*event.wo.z();
-            Vec3f brdfSpecular = event.throughput*event.pdf;
+            Vec3f brdfSpecular = event.weight*event.pdf;
             float pdfSubstrate = SampleWarp::cosineHemispherePdf(event.wo)*(1.0f - specularProbability);
             float pdfSpecular = event.pdf*specularProbability;
 
-            event.throughput = (brdfSpecular + brdfSubstrate)/(pdfSpecular + pdfSubstrate);
+            event.weight = (brdfSpecular + brdfSubstrate)/(pdfSpecular + pdfSubstrate);
             event.pdf = pdfSpecular + pdfSubstrate;
         }
         return true;
@@ -106,19 +94,19 @@ bool RoughPlasticBsdf::sample(SurfaceScatterEvent &event) const
         Vec3f diffuseAlbedo = albedo(event.info);
 
         event.wo = wo;
-        event.throughput = ((1.0f - Fi)*(1.0f - Fo)*eta*eta)*(diffuseAlbedo/(1.0f - diffuseAlbedo*_diffuseFresnel));
+        event.weight = ((1.0f - Fi)*(1.0f - Fo)*eta*eta)*(diffuseAlbedo/(1.0f - diffuseAlbedo*_diffuseFresnel));
         if (_scaledSigmaA.max() > 0.0f)
-            event.throughput *= std::exp(_scaledSigmaA*(-1.0f/event.wo.z() - 1.0f/event.wi.z()));
+            event.weight *= std::exp(_scaledSigmaA*(-1.0f/event.wo.z() - 1.0f/event.wi.z()));
 
         event.pdf = SampleWarp::cosineHemispherePdf(event.wo);
         if (sampleR) {
-            Vec3f brdfSubstrate = event.throughput*event.pdf;
+            Vec3f brdfSubstrate = event.weight*event.pdf;
             float  pdfSubstrate = event.pdf*(1.0f - specularProbability);
-            Vec3f brdfSpecular = RoughDielectricBsdf::evalBase(event, true, false, (*_roughness)[event.info->uv].x(), _ior, _distribution);
-            float pdfSpecular  = RoughDielectricBsdf::pdfBase(event, true, false, (*_roughness)[event.info->uv].x(), _ior, _distribution);
+            Vec3f brdfSpecular = RoughDielectricBsdf::evalBase(event, true, false, (*_roughness)[*event.info].x(), _ior, _distribution);
+            float pdfSpecular  = RoughDielectricBsdf::pdfBase(event, true, false, (*_roughness)[*event.info].x(), _ior, _distribution);
             pdfSpecular *= specularProbability;
 
-            event.throughput = (brdfSpecular + brdfSubstrate)/(pdfSpecular + pdfSubstrate);
+            event.weight = (brdfSpecular + brdfSubstrate)/(pdfSpecular + pdfSubstrate);
             event.pdf = pdfSpecular + pdfSubstrate;
         }
         event.sampledLobe = BsdfLobes::DiffuseReflectionLobe;
@@ -137,7 +125,7 @@ Vec3f RoughPlasticBsdf::eval(const SurfaceScatterEvent &event) const
 
     Vec3f glossyR(0.0f);
     if (sampleR)
-        glossyR = RoughDielectricBsdf::evalBase(event, true, false, (*_roughness)[event.info->uv].x(), _ior, _distribution);
+        glossyR = RoughDielectricBsdf::evalBase(event, true, false, (*_roughness)[*event.info].x(), _ior, _distribution);
 
     Vec3f diffuseR(0.0f);
     if (sampleT) {
@@ -166,7 +154,7 @@ float RoughPlasticBsdf::pdf(const SurfaceScatterEvent &event) const
 
     float glossyPdf = 0.0f;
     if (sampleR)
-        glossyPdf = RoughDielectricBsdf::pdfBase(event, true, false, (*_roughness)[event.info->uv].x(), _ior, _distribution);
+        glossyPdf = RoughDielectricBsdf::pdfBase(event, true, false, (*_roughness)[*event.info].x(), _ior, _distribution);
 
     float diffusePdf = 0.0f;
     if (sampleT)
@@ -182,6 +170,16 @@ float RoughPlasticBsdf::pdf(const SurfaceScatterEvent &event) const
         glossyPdf *= specularProbability;
     }
     return glossyPdf + diffusePdf;
+}
+
+void RoughPlasticBsdf::prepareForRender()
+{
+    _scaledSigmaA = _thickness*_sigmaA;
+    _avgTransmittance = std::exp(-2.0f*_scaledSigmaA.avg());
+
+    _distribution = Microfacet::stringToType(_distributionName);
+
+    _diffuseFresnel = Fresnel::computeDiffuseFresnel(_ior, 1000000);
 }
 
 }

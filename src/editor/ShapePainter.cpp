@@ -1,13 +1,14 @@
 #include "ShapePainter.hpp"
 
-#include "render/VertexBuffer.hpp"
-#include "render/Shader.hpp"
+#include "opengl/VertexBuffer.hpp"
+#include "opengl/Shader.hpp"
 
 #include "math/MathUtil.hpp"
 #include "math/Mat4f.hpp"
 #include "math/Angle.hpp"
 
 #include "io/FileUtils.hpp"
+#include "io/Path.hpp"
 
 namespace Tungsten {
 
@@ -25,11 +26,11 @@ void ShapePainter::initialize()
     _vbo->setStandardAttributes(VBO_ATT_POSITION | VBO_ATT_COLOR);
     _vbo->initBuffer();
 
-    std::string exePath = FileUtils::getExecutablePath();
-    std::string shaderBasePath = FileUtils::extractParent(exePath) + "/data/shaders/";
+    Path exePath = FileUtils::getExecutablePath();
+    Path shaderBasePath = exePath.parent()/"data/shaders/";
 
     _defaultShader =
-        new Shader(shaderBasePath.c_str(), "Preamble.txt", "Primitive.vert", nullptr, "Primitive.frag", 1);
+        new Shader(shaderBasePath, "Preamble.txt", "Primitive.vert", "", "Primitive.frag", 1);
 
     _initialized = true;
 }
@@ -43,8 +44,14 @@ ShapePainter::ShapePainter(DrawMode mode)
 
     _defaultShader->bind();
     Vec4i viewport;
-    glGetIntegerv(GL_VIEWPORT, viewport.data());
-    Mat4f proj(Mat4f::ortho(0.0f, viewport.z(), viewport.w(), 0.0f, -1.0f, 1.0f));
+    glf->glGetIntegerv(GL_VIEWPORT, viewport.data());
+    Mat4f proj(Mat4f::ortho(0.0f, float(viewport.z()), float(viewport.w()), 0.0f, -1.0f, 1.0f));
+    _defaultShader->uniformMat("ModelViewProjection", proj, true);
+}
+
+ShapePainter::ShapePainter(const Mat4f &proj, DrawMode mode)
+: ShapePainter(mode)
+{
     _defaultShader->uniformMat("ModelViewProjection", proj, true);
 }
 
@@ -69,19 +76,24 @@ void ShapePainter::flush()
     for (uint32 i = 0; i < _verts.size(); i += MaxVertices) {
         uint32 batchSize = min(MaxVertices, uint32(_verts.size() - i));
         _vbo->bind();
-        _vbo->copyData(&_verts[i], batchSize*sizeof(VboVertex), GL_DYNAMIC_DRAW);
+        _vbo->copyData(&_verts[i], batchSize*sizeof(VboVertex));
         _vbo->draw(*_defaultShader, toGlMode(), batchSize);
     }
     _verts.clear();
 }
 
-void ShapePainter::addVertexRaw(Vec2f p)
+void ShapePainter::addVertexRaw(Vec3f p)
 {
     if (_mode == MODE_QUADS && (_verts.size() % 6) == 3) {
         _verts.push_back(_verts[_verts.size() - 3]);
         _verts.push_back(_verts[_verts.size() - 2]);
     }
-    _verts.push_back(VboVertex{Vec3f(p.x(), p.y(), 0.0f), Vec4c(_color*255.0f)});
+    _verts.push_back(VboVertex{p, Vec4c(_color*255.0f)});
+}
+
+void ShapePainter::addVertexRaw(Vec2f p)
+{
+    addVertexRaw(Vec3f(p.x(), p.y(), 0.0f));
 }
 
 void ShapePainter::addVertex(Vec2f p)
@@ -204,6 +216,13 @@ void ShapePainter::drawLineStipple(Vec2f x0, Vec2f x1, float period, float width
         for (float f = 0.0f; f < 1.0f; f += period*0.5f)
             drawEllipse(x0 + d*f, Vec2f(width*0.5f));
     }
+}
+
+void ShapePainter::drawLine(Vec3f x0, Vec3f x1)
+{
+    begin(MODE_LINES);
+    addVertexRaw(x0);
+    addVertexRaw(x1);
 }
 
 }

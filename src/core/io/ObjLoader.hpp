@@ -3,6 +3,7 @@
 
 #include "TextureCache.hpp"
 #include "ObjMaterial.hpp"
+#include "Path.hpp"
 
 #include "primitives/Triangle.hpp"
 #include "primitives/Vertex.hpp"
@@ -13,7 +14,6 @@
 #include "math/Box.hpp"
 
 #include <unordered_map>
-#include <fstream>
 #include <string>
 #include <vector>
 #include <memory>
@@ -24,6 +24,12 @@ class Primitive;
 
 class ObjLoader
 {
+    struct SegmentI
+    {
+        uint32 v0;
+        uint32 v1;
+    };
+
     bool _geometryOnly;
 
     std::shared_ptr<Bsdf> _errorMaterial;
@@ -42,6 +48,7 @@ class ObjLoader
 
     std::unordered_map<Vec3i, uint32> _indices;
     std::vector<TriangleI> _tris;
+    std::vector<SegmentI> _segments;
     std::vector<Vertex> _verts;
     Box3f _bounds;
 
@@ -56,26 +63,31 @@ class ObjLoader
 
     template<unsigned Size>
     Vec<float, Size> loadVector(const char *s);
+    void loadCurve(const char *line);
     void loadFace(const char *line);
     void loadMaterialLibrary(const char *path);
     void loadLine(const char *line);
-    void loadFile(std::ifstream &in);
+    void loadFile(std::istream &in);
 
     std::shared_ptr<Bsdf> convertObjMaterial(const ObjMaterial &mat);
 
     std::string generateDummyName() const;
     void clearPerMeshData();
 
+    void finalizeCurveData(std::vector<uint32> &curveEnds, std::vector<Vec4f> &nodeData);
+
     std::shared_ptr<Primitive> tryInstantiateSphere(const std::string &name, std::shared_ptr<Bsdf> &bsdf);
     std::shared_ptr<Primitive> tryInstantiateQuad(const std::string &name, std::shared_ptr<Bsdf> &bsdf);
+    std::shared_ptr<Primitive> tryInstantiateCube(const std::string &name, std::shared_ptr<Bsdf> &bsdf);
     std::shared_ptr<Primitive> finalizeMesh();
 
-    ObjLoader(std::ifstream &in, const std::string &path, std::shared_ptr<TextureCache> cache);
-    ObjLoader(std::ifstream &in);
+    ObjLoader(std::istream &in, const Path &path, std::shared_ptr<TextureCache> cache);
+    ObjLoader(std::istream &in);
 
 public:
-    static Scene *load(const std::string &path, std::shared_ptr<TextureCache> cache = nullptr);
-    static bool loadGeometryOnly(const std::string &path, std::vector<Vertex> &verts, std::vector<TriangleI> &tris);
+    static Scene *load(const Path &path, std::shared_ptr<TextureCache> cache = nullptr);
+    static bool loadGeometryOnly(const Path &path, std::vector<Vertex> &verts, std::vector<TriangleI> &tris);
+    static bool loadCurvesOnly(const Path &path, std::vector<uint32> &curveEnds, std::vector<Vec4f> &nodeData);
 };
 
 }

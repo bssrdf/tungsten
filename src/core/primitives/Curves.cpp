@@ -1,13 +1,17 @@
 #include "Curves.hpp"
 #include "TriangleMesh.hpp"
 
+#include "sampling/UniformSampler.hpp"
+
 #include "math/TangentFrame.hpp"
 #include "math/MathUtil.hpp"
 #include "math/BSpline.hpp"
 #include "math/Vec.hpp"
 
+#include "io/JsonObject.hpp"
 #include "io/FileUtils.hpp"
 #include "io/CurveIO.hpp"
+#include "io/Scene.hpp"
 
 namespace Tungsten {
 
@@ -73,7 +77,7 @@ static inline void intersectHalfCylinder(StackNode node, float tMin,
     float newT = segmentT*(node.tMax - node.tMin) + node.tMin;
 
     if (newT >= 0.0f && newT <= 1.0f) {
-        isect.uv = Vec2f(newT, 0.0f);
+        isect.uv = Vec2f(newT, 0.5f + 0.5f*distance/width);
         isect.t = t0;
         isect.w = width;
         tMax = t0;
@@ -223,7 +227,11 @@ static Box3f curveBox(const Vec4f &q0, const Vec4f &q1, const Vec4f &q2)
 }
 
 Curves::Curves()
-: _modeString("half_cylinder")
+: _modeString("half_cylinder"),
+  _curveThickness(0.01f),
+  _subsample(0.0f),
+  _overrideThickness(false),
+  _taperThickness(false)
 {
     init();
 }
@@ -231,16 +239,37 @@ Curves::Curves()
 Curves::Curves(const Curves &o)
 : Primitive(o)
 {
-    _modeString = o._modeString;
-    _mode       = o._mode;
-    _path       = o._path;
-    _curveCount = o._curveCount;
-    _nodeCount  = o._nodeCount;
-    _curveEnds  = o._curveEnds;
-    _nodeData   = o._nodeData;
-    _nodeColor  = o._nodeColor;
-    _proxy      = o._proxy;
-    _bounds     = o._bounds;
+    _modeString        = o._modeString;
+    _curveThickness    = o._curveThickness;
+    _taperThickness    = o._taperThickness;
+    _overrideThickness = o._overrideThickness;
+    _mode              = o._mode;
+    _path              = o._path;
+    _curveCount        = o._curveCount;
+    _nodeCount         = o._nodeCount;
+    _curveEnds         = o._curveEnds;
+    _nodeData          = o._nodeData;
+    _nodeColor         = o._nodeColor;
+    _nodeNormals       = o._nodeNormals;
+    _bsdf              = o._bsdf;
+    _proxy             = o._proxy;
+    _bounds            = o._bounds;
+}
+
+Curves::Curves(std::vector<uint32> curveEnds, std::vector<Vec4f> nodeData, std::shared_ptr<Bsdf> bsdf, std::string name)
+: Primitive(name),
+  _path(std::make_shared<Path>(name.append(".fiber"))),
+  _modeString("half_cylinder"),
+  _curveThickness(0.01f),
+  _overrideThickness(false),
+  _taperThickness(false),
+  _curveCount(curveEnds.size()),
+  _nodeCount(nodeData.size()),
+  _curveEnds(std::move(curveEnds)),
+  _nodeData(std::move(nodeData)),
+  _bsdf(std::move(bsdf))
+{
+    init();
 }
 
 void Curves::init()
@@ -265,10 +294,23 @@ void Curves::loadCurves()
     data.nodeColor = &_nodeColor;
     data.nodeNormal = &_nodeNormals;
 
-    CurveIO::load(_path, data);
+    if (_path && !CurveIO::load(*_path, data))
+        DBG("Unable to load curves at %s", *_path);
 
     _nodeCount = _nodeData.size();
     _curveCount = _curveEnds.size();
+
+    if (_overrideThickness || _taperThickness) {
+        for (uint32 i = 0; i < _curveCount; ++i) {
+            uint32 start = i ? _curveEnds[i - 1] : 0;
+            for (uint32 t = start; t < _curveEnds[i]; ++t) {
+                float thickness = _overrideThickness ? _curveThickness : _nodeData[t].w();
+                if (_taperThickness)
+                    thickness *= 1.0f - (t - start - 0.5f)/(_curveEnds[i] - start - 1);
+                _nodeData[t].w() = thickness;
+            }
+        }
+    }
 }
 
 void Curves::computeBounds()
@@ -332,28 +374,53 @@ void Curves::buildProxy()
         }
     }
 
-    _proxy = std::make_shared<TriangleMesh>(verts, tris, _bsdf, "Curves", false);
+    _proxy = std::make_shared<TriangleMesh>(verts, tris, _bsdf, "Curves", false, false);
 }
 
 void Curves::fromJson(const rapidjson::Value &v, const Scene &scene)
 {
     Primitive::fromJson(v, scene);
-    JsonUtils::fromJson(v, "file", _path);
+    _path = scene.fetchResource(v, "file");
+    _bsdf = scene.fetchBsdf(JsonUtils::fetchMember(v, "bsdf"));
     JsonUtils::fromJson(v, "mode", _modeString);
-    _dir = FileUtils::getCurrentDir();
+    JsonUtils::fromJson(v, "curve_taper", _taperThickness);
+    JsonUtils::fromJson(v, "subsample", _subsample);
+    _overrideThickness = JsonUtils::fromJson(v, "curve_thickness", _curveThickness);
 
     init();
-
-    loadCurves();
 }
 
 rapidjson::Value Curves::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Primitive::toJson(allocator);
-    v.AddMember("type", "curves", allocator);
-    v.AddMember("file", _path.c_str(), allocator);
-    v.AddMember("mode", _modeString.c_str(), allocator);
-    return std::move(v);
+    JsonObject result{Primitive::toJson(allocator), allocator,
+        "type", "curves",
+        "curve_taper", _taperThickness,
+        "subsample", _subsample,
+        "mode", _modeString,
+        "bsdf", *_bsdf
+    };
+    if (_path)
+        result.add("file", *_path);
+    if (_overrideThickness)
+        result.add("curve_thickness", _curveThickness);
+
+    return result;
+}
+
+void Curves::loadResources()
+{
+    loadCurves();
+}
+
+void Curves::saveResources()
+{
+    CurveIO::CurveData data;
+    data.curveEnds = &_curveEnds;
+    data.nodeData  = &_nodeData;
+    data.nodeColor = &_nodeColor;
+
+    if (_path)
+        CurveIO::save(*_path, data);
 }
 
 bool Curves::intersect(Ray &ray, IntersectionTemporary &data) const
@@ -381,7 +448,7 @@ bool Curves::intersectTemplate(Ray &ray, IntersectionTemporary &data) const
     bool didIntersect = false;
     CurveIntersection &isect = *data.as<CurveIntersection>();
 
-    _bvh->trace(ray, [&](Ray &ray, uint32 id) {
+    _bvh->trace(ray, [&](Ray &ray, uint32 id, float /*tMin*/) {
         Vec4f q0(project(o, lx, ly, lz, _nodeData[id - 2]));
         Vec4f q1(project(o, lx, ly, lz, _nodeData[id - 1]));
         Vec4f q2(project(o, lx, ly, lz, _nodeData[id - 0]));
@@ -443,6 +510,7 @@ void Curves::intersectionInfo(const IntersectionTemporary &data, IntersectionInf
 
     info.uv = isect.uv;
     info.primitive = this;
+    info.bsdf = _bsdf.get();
 
     if (_mode == MODE_CYLINDER)
         info.epsilon = max(info.epsilon, 0.1f*isect.w);
@@ -459,9 +527,9 @@ bool Curves::tangentSpace(const IntersectionTemporary &data, const IntersectionI
     float t = isect.uv.x();
     Vec3f tangent = BSpline::quadraticDeriv(_nodeData[p0].xyz(), _nodeData[p0 + 1].xyz(), _nodeData[p0 + 2].xyz(), t);
 
-    T = tangent.normalized();
-    B = T.cross(info.Ng);
-    return false;
+    B = tangent.normalized();
+    T = B.cross(info.Ng);
+    return true;
 }
 
 bool Curves::isSamplable() const
@@ -469,23 +537,8 @@ bool Curves::isSamplable() const
     return false;
 }
 
-void Curves::makeSamplable()
+void Curves::makeSamplable(const TraceableScene &/*scene*/, uint32 /*threadIndex*/)
 {
-}
-
-float Curves::inboundPdf(const IntersectionTemporary &/*data*/, const Vec3f &/*p*/, const Vec3f &/*d*/) const
-{
-    return 0.0f;
-}
-
-bool Curves::sampleInboundDirection(LightSample &/*sample*/) const
-{
-    return false;
-}
-
-bool Curves::sampleOutboundDirection(LightSample &/*sample*/) const
-{
-    return false;
 }
 
 bool Curves::invertParametrization(Vec2f /*uv*/, Vec3f &/*pos*/) const
@@ -493,9 +546,9 @@ bool Curves::invertParametrization(Vec2f /*uv*/, Vec3f &/*pos*/) const
     return false;
 }
 
-bool Curves::isDelta() const
+bool Curves::isDirac() const
 {
-    return false;
+    return _nodeCount == 0 || _curveCount == 0;
 }
 
 bool Curves::isInfinite() const
@@ -503,7 +556,7 @@ bool Curves::isInfinite() const
     return false;
 }
 
-float Curves::approximateRadiance(const Vec3f &/*p*/) const
+float Curves::approximateRadiance(uint32 /*threadIndex*/, const Vec3f &/*p*/) const
 {
     return -1.0f;
 }
@@ -535,10 +588,14 @@ void Curves::prepareForRender()
         data.w() *= widthScale;
     }
 
+    UniformSampler rand;
     for (uint32 i = 0; i < _curveCount; ++i) {
         uint32 start = 0;
         if (i > 0)
             start = _curveEnds[i - 1];
+
+        if (_subsample > 0.0f && rand.next1D() < _subsample)
+            continue;
 
         for (uint32 t = start + 2; t < _curveEnds[i]; ++t) {
             const Vec4f &p0 = _nodeData[t - 2];
@@ -558,32 +615,38 @@ void Curves::prepareForRender()
     //_needsRayTransform = true;
 
     computeBounds();
+
+    Primitive::prepareForRender();
 }
 
-void Curves::cleanupAfterRender()
+void Curves::teardownAfterRender()
 {
     _bvh.reset();
-    std::string dir = FileUtils::getCurrentDir();
-    FileUtils::changeCurrentDir(_dir);
     // TODO
     loadCurves();
-    FileUtils::changeCurrentDir(dir);
+
+    Primitive::teardownAfterRender();
 }
 
+
+int Curves::numBsdfs() const
+{
+    return 1;
+}
+
+std::shared_ptr<Bsdf> &Curves::bsdf(int /*index*/)
+{
+    return _bsdf;
+}
+
+void Curves::setBsdf(int /*index*/, std::shared_ptr<Bsdf> &bsdf)
+{
+    _bsdf = bsdf;
+}
 
 Primitive *Curves::clone()
 {
     return new Curves(*this);
-}
-
-void Curves::saveData()
-{
-    CurveIO::CurveData data;
-    data.curveEnds = &_curveEnds;
-    data.nodeData  = &_nodeData;
-    data.nodeColor = &_nodeColor;
-
-    CurveIO::save(_path, data);
 }
 
 }

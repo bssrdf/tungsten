@@ -1,7 +1,7 @@
 #include "TriangleMesh.hpp"
 #include "EmbreeUtil.hpp"
 
-#include "sampling/SampleGenerator.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 #include "sampling/SampleWarp.hpp"
 
 #include "math/TangentFrame.hpp"
@@ -10,11 +10,10 @@
 #include "math/Box.hpp"
 
 #include "io/JsonSerializable.hpp"
-#include "io/JsonUtils.hpp"
+#include "io/JsonObject.hpp"
 #include "io/MeshIO.hpp"
 #include "io/Scene.hpp"
 
-#include <rapidjson/document.h>
 #include <unordered_map>
 #include <iostream>
 
@@ -23,7 +22,6 @@ namespace Tungsten {
 struct MeshIntersection
 {
     Vec3f Ng;
-    Vec3f p;
     float u;
     float v;
     int id0;
@@ -32,7 +30,9 @@ struct MeshIntersection
 };
 
 TriangleMesh::TriangleMesh()
-: _smoothed(false)
+: _smoothed(false),
+  _backfaceCulling(false),
+  _recomputeNormals(false)
 {
 }
 
@@ -40,20 +40,40 @@ TriangleMesh::TriangleMesh(const TriangleMesh &o)
 : Primitive(o),
   _path(o._path),
   _smoothed(o._smoothed),
+  _backfaceCulling(o._backfaceCulling),
+  _recomputeNormals(o._recomputeNormals),
   _verts(o._verts),
   _tris(o._tris),
+  _bsdfs(o._bsdfs),
   _bounds(o._bounds)
 {
 }
 
 TriangleMesh::TriangleMesh(std::vector<Vertex> verts, std::vector<TriangleI> tris,
              const std::shared_ptr<Bsdf> &bsdf,
-             const std::string &name, bool smoothed)
-: Primitive(name, bsdf),
-  _path(std::string(name).append(".wo3")),
+             const std::string &name, bool smoothed, bool backfaceCull)
+: TriangleMesh(
+      std::move(verts),
+      std::move(tris),
+      std::vector<std::shared_ptr<Bsdf>>(1, bsdf),
+      name,
+      smoothed,
+      backfaceCull
+  )
+{
+}
+
+TriangleMesh::TriangleMesh(std::vector<Vertex> verts, std::vector<TriangleI> tris,
+             std::vector<std::shared_ptr<Bsdf>> bsdfs,
+             const std::string &name, bool smoothed, bool backfaceCull)
+: Primitive(name),
+  _path(std::make_shared<Path>(std::string(name).append(".wo3"))),
   _smoothed(smoothed),
+  _backfaceCulling(backfaceCull),
+  _recomputeNormals(false),
   _verts(std::move(verts)),
-  _tris(std::move(tris))
+  _tris(std::move(tris)),
+  _bsdfs(std::move(bsdfs))
 {
 }
 
@@ -84,38 +104,76 @@ Vec2f TriangleMesh::uvAt(int triangle, float u, float v) const
     return (1.0f - u - v)*uv0 + u*uv1 + v*uv2;
 }
 
+float TriangleMesh::powerToRadianceFactor() const
+{
+    return INV_PI*_invArea;
+}
+
+
 void TriangleMesh::fromJson(const rapidjson::Value &v, const Scene &scene)
 {
     Primitive::fromJson(v, scene);
 
-    _path = JsonUtils::as<std::string>(v, "file");
+    _path = scene.fetchResource(v, "file");
     JsonUtils::fromJson(v, "smooth", _smoothed);
+    JsonUtils::fromJson(v, "backface_culling", _backfaceCulling);
+    JsonUtils::fromJson(v, "recompute_normals", _recomputeNormals);
 
-    MeshIO::load(_path, _verts, _tris);
+    auto bsdf = v.FindMember("bsdf");
+    if (bsdf != v.MemberEnd() && bsdf->value.IsArray()) {
+        if (bsdf->value.Size() == 0)
+            FAIL("Empty BSDF array for triangle mesh");
+        for (int i = 0; i < int(bsdf->value.Size()); ++i)
+            _bsdfs.emplace_back(scene.fetchBsdf(bsdf->value[i]));
+    } else {
+        _bsdfs.emplace_back(scene.fetchBsdf(JsonUtils::fetchMember(v, "bsdf")));
+    }
 }
 
 rapidjson::Value TriangleMesh::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Primitive::toJson(allocator);
-    v.AddMember("type", "mesh", allocator);
-    v.AddMember("file", _path.c_str(), allocator);
-    v.AddMember("smooth", _smoothed, allocator);
-    return std::move(v);
+    JsonObject result{Primitive::toJson(allocator), allocator,
+        "type", "mesh",
+        "smooth", _smoothed,
+        "backface_culling", _backfaceCulling,
+        "recompute_normals", _recomputeNormals
+    };
+    if (_path)
+        result.add("file", *_path);
+    if (_bsdfs.size() == 1) {
+        result.add("bsdf", *_bsdfs[0]);
+    } else {
+        rapidjson::Value a(rapidjson::kArrayType);
+        for (const auto &bsdf : _bsdfs)
+            a.PushBack(bsdf->toJson(allocator), allocator);
+        result.add("bsdf", std::move(a));
+    }
+
+    return result;
 }
 
-void TriangleMesh::saveData()
+void TriangleMesh::loadResources()
 {
-    MeshIO::save(_path, _verts, _tris);
+    if (_path && !MeshIO::load(*_path, _verts, _tris))
+        DBG("Unable to load triangle mesh at %s", *_path);
+    if (_recomputeNormals && _smoothed)
+        calcSmoothVertexNormals();
 }
 
-void TriangleMesh::saveAsObj(const std::string &path) const
+void TriangleMesh::saveResources()
+{
+    if (_path)
+        MeshIO::save(*_path, _verts, _tris);
+}
+
+void TriangleMesh::saveAsObj(const Path &path) const
 {
     MeshIO::save(path, _verts, _tris);
 }
 
 void TriangleMesh::calcSmoothVertexNormals()
 {
-    static CONSTEXPR float SplitLimit = std::cos(PI*0.15f);
+    static const float SplitLimit = std::cos(PI*0.15f);
     //static CONSTEXPR float SplitLimit = -1.0f;
 
     std::vector<Vec3f> geometricN(_verts.size(), Vec3f(0.0f));
@@ -180,6 +238,28 @@ void TriangleMesh::computeBounds()
     _bounds = box;
 }
 
+void TriangleMesh::makeCube()
+{
+    const Vec3f verts[6][4] = {
+        {{-0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f,  0.5f}, { 0.5f, -0.5f,  0.5f}, { 0.5f, -0.5f, -0.5f}},
+        {{-0.5f,  0.5f,  0.5f}, {-0.5f,  0.5f, -0.5f}, { 0.5f,  0.5f, -0.5f}, { 0.5f,  0.5f,  0.5f}},
+        {{-0.5f,  0.5f, -0.5f}, {-0.5f, -0.5f, -0.5f}, { 0.5f, -0.5f, -0.5f}, { 0.5f,  0.5f, -0.5f}},
+        {{ 0.5f,  0.5f,  0.5f}, { 0.5f, -0.5f,  0.5f}, {-0.5f, -0.5f,  0.5f}, {-0.5f,  0.5f,  0.5f}},
+        {{-0.5f,  0.5f,  0.5f}, {-0.5f, -0.5f,  0.5f}, {-0.5f, -0.5f, -0.5f}, {-0.5f,  0.5f, -0.5f}},
+        {{ 0.5f,  0.5f, -0.5f}, { 0.5f, -0.5f, -0.5f}, { 0.5f, -0.5f,  0.5f}, { 0.5f,  0.5f,  0.5f}},
+    };
+    const Vec2f uvs[] = {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+
+    for (int i = 0; i < 6; ++i) {
+        int idx = _verts.size();
+        _tris.emplace_back(idx, idx + 2, idx + 1);
+        _tris.emplace_back(idx, idx + 3, idx + 2);
+
+        for (int j = 0; j < 4; ++j)
+            _verts.emplace_back(verts[i][j], uvs[j]);
+    }
+}
+
 void TriangleMesh::makeSphere(float radius)
 {
     CONSTEXPR int SubDiv = 10;
@@ -226,7 +306,6 @@ bool TriangleMesh::intersect(Ray &ray, IntersectionTemporary &data) const
         data.primitive = this;
         MeshIntersection *isect = data.as<MeshIntersection>();
         isect->Ng = unnormalizedGeometricNormalAt(eRay.id0);
-        isect->p = EmbreeUtil::convert(eRay.org + eRay.dir*eRay.tfar);
         isect->u = eRay.u;
         isect->v = eRay.v;
         isect->id0 = eRay.id0;
@@ -254,7 +333,7 @@ void TriangleMesh::intersectionInfo(const IntersectionTemporary &data, Intersect
         info.Ns = info.Ng;
     info.uv = uvAt(isect->id0, isect->u, isect->v);
     info.primitive = this;
-    info.p = isect->p;
+    info.bsdf = _bsdfs[_tris[isect->id0].material].get();
 }
 
 bool TriangleMesh::hitBackside(const IntersectionTemporary &data) const
@@ -280,9 +359,8 @@ bool TriangleMesh::tangentSpace(const IntersectionTemporary &data, const Interse
     float invDet = s1*t2 - s2*t1;
     if (std::abs(invDet) < 1e-6f)
         return false;
-    float det = 1.0f/invDet;
-    T = det*(q1*t2 - t1*q2);
-    B = det*(q2*s1 - s2*q1);
+    T = (q1*t2 - t1*q2).normalized();
+    B = (q2*s1 - s2*q1).normalized();
 
     return true;
 }
@@ -294,11 +372,14 @@ const TriangleMesh &TriangleMesh::asTriangleMesh()
 
 bool TriangleMesh::isSamplable() const
 {
-    return _triSampler.operator bool();
+    return true;
 }
 
-void TriangleMesh::makeSamplable()
+void TriangleMesh::makeSamplable(const TraceableScene &/*scene*/, uint32 /*threadIndex*/)
 {
+    if (_triSampler)
+        return;
+
     std::vector<float> areas(_tris.size());
     _totalArea = 0.0f;
     for (size_t i = 0; i < _tris.size(); ++i) {
@@ -311,31 +392,53 @@ void TriangleMesh::makeSamplable()
     _triSampler.reset(new Distribution1D(std::move(areas)));
 }
 
-float TriangleMesh::inboundPdf(const IntersectionTemporary &data, const Vec3f &p, const Vec3f &d) const
+bool TriangleMesh::samplePosition(PathSampleGenerator &sampler, PositionSample &sample) const
 {
-    const MeshIntersection *isect = data.as<MeshIntersection>();
-
-    return (p - isect->p).lengthSq()/(-d.dot(isect->Ng.normalized())*_totalArea);
-}
-
-bool TriangleMesh::sampleInboundDirection(LightSample &sample) const
-{
-    float u = sample.sampler->next1D();
+    float u = sampler.next1D();
     int idx;
     _triSampler->warp(u, idx);
 
     Vec3f p0 = _tfVerts[_tris[idx].v0].pos();
     Vec3f p1 = _tfVerts[_tris[idx].v1].pos();
     Vec3f p2 = _tfVerts[_tris[idx].v2].pos();
+    Vec2f uv0 = _tfVerts[_tris[idx].v0].uv();
+    Vec2f uv1 = _tfVerts[_tris[idx].v1].uv();
+    Vec2f uv2 = _tfVerts[_tris[idx].v2].uv();
     Vec3f normal = (p1 - p0).cross(p2 - p0).normalized();
 
-    Vec3f p = SampleWarp::uniformTriangle(sample.sampler->next2D(), p0, p1, p2);
-    Vec3f L = p - sample.p;
+    Vec2f lambda = SampleWarp::uniformTriangleUv(sampler.next2D());
+
+    sample.p = p0*lambda.x() + p1*lambda.y() + p2*(1.0f - lambda.x() - lambda.y());
+    sample.uv = uv0*lambda.x() + uv1*lambda.y() + uv2*(1.0f - lambda.x() - lambda.y());
+    sample.weight = PI*_totalArea*(*_emission)[sample.uv];
+    sample.pdf = _invArea;
+    sample.Ng = normal;
+
+    return true;
+}
+
+bool TriangleMesh::sampleDirection(PathSampleGenerator &sampler, const PositionSample &point, DirectionSample &sample) const
+{
+    Vec3f d = SampleWarp::cosineHemisphere(sampler.next2D());
+    sample.d = TangentFrame(point.Ng).toGlobal(d);
+    sample.weight = Vec3f(1.0f);
+    sample.pdf = SampleWarp::cosineHemispherePdf(d);
+
+    return true;
+}
+
+bool TriangleMesh::sampleDirect(uint32 /*threadIndex*/, const Vec3f &p,
+        PathSampleGenerator &sampler, LightSample &sample) const
+{
+    PositionSample point;
+    samplePosition(sampler, point);
+
+    Vec3f L = point.p - p;
 
     float rSq = L.lengthSq();
     sample.dist = std::sqrt(rSq);
     sample.d = L/sample.dist;
-    float cosTheta = -(normal.dot(sample.d));
+    float cosTheta = -(point.Ng.dot(sample.d));
     if (cosTheta <= 0.0f)
         return false;
     sample.pdf = rSq/(cosTheta*_totalArea);
@@ -343,24 +446,35 @@ bool TriangleMesh::sampleInboundDirection(LightSample &sample) const
     return true;
 }
 
-bool TriangleMesh::sampleOutboundDirection(LightSample &sample) const
+float TriangleMesh::positionalPdf(const PositionSample &/*point*/) const
 {
-    float u = sample.sampler->next1D();
-    int idx;
-    _triSampler->warp(u, idx);
+    return _invArea;
+}
 
-    Vec3f p0 = _tfVerts[_tris[idx].v0].pos();
-    Vec3f p1 = _tfVerts[_tris[idx].v1].pos();
-    Vec3f p2 = _tfVerts[_tris[idx].v2].pos();
-    Vec3f normal = (p1 - p0).cross(p2 - p0).normalized();
-    TangentFrame frame(normal);
+float TriangleMesh::directionalPdf(const PositionSample &point, const DirectionSample &sample) const
+{
+    return max(sample.d.dot(point.Ng)*INV_PI, 0.0f);
+}
 
-    sample.p = SampleWarp::uniformTriangle(sample.sampler->next2D(), p0, p1, p2);
-    sample.d = SampleWarp::cosineHemisphere(sample.sampler->next2D());
-    sample.pdf = SampleWarp::cosineHemispherePdf(sample.d)/_totalArea;
-    sample.d = frame.toGlobal(sample.d);
+float TriangleMesh::directPdf(uint32 /*threadIndex*/, const IntersectionTemporary &/*data*/,
+        const IntersectionInfo &info, const Vec3f &p) const
+{
+    return (p - info.p).lengthSq()/(-info.w.dot(info.Ng)*_totalArea);
+}
 
-    return true;
+Vec3f TriangleMesh::evalPositionalEmission(const PositionSample &sample) const
+{
+    return PI*(*_emission)[sample.uv];
+}
+
+Vec3f TriangleMesh::evalDirectionalEmission(const PositionSample &point, const DirectionSample &sample) const
+{
+    return Vec3f(max(sample.d.dot(point.Ng), 0.0f)*INV_PI);
+}
+
+Vec3f TriangleMesh::evalDirect(const IntersectionTemporary &data, const IntersectionInfo &info) const
+{
+    return data.as<MeshIntersection>()->backSide ? Vec3f(0.0f) : (*_emission)[info.uv];
 }
 
 bool TriangleMesh::invertParametrization(Vec2f /*uv*/, Vec3f &/*pos*/) const
@@ -368,9 +482,9 @@ bool TriangleMesh::invertParametrization(Vec2f /*uv*/, Vec3f &/*pos*/) const
     return false;
 }
 
-bool TriangleMesh::isDelta() const
+bool TriangleMesh::isDirac() const
 {
-    return false;
+    return _verts.empty() || _tris.empty();
 }
 
 bool TriangleMesh::isInfinite() const
@@ -379,7 +493,7 @@ bool TriangleMesh::isInfinite() const
 }
 
 // Questionable, but there is no cheap and realiable way to compute this factor
-float TriangleMesh::approximateRadiance(const Vec3f &/*p*/) const
+float TriangleMesh::approximateRadiance(uint32 /*threadIndex*/, const Vec3f &/*p*/) const
 {
     return -1.0f;
 }
@@ -393,12 +507,16 @@ void TriangleMesh::prepareForRender()
 {
     computeBounds();
 
+    if (_verts.empty() || _tris.empty())
+        return;
+
     _geom = embree::rtcNewTriangleMesh(_tris.size(), _verts.size(), "bvh2");
     embree::RTCVertex   *vs = embree::rtcMapPositionBuffer(_geom);
     embree::RTCTriangle *ts = embree::rtcMapTriangleBuffer(_geom);
 
     for (size_t i = 0; i < _tris.size(); ++i) {
         const TriangleI &t = _tris[i];
+        _tris[i].material = clamp(_tris[i].material, 0, int(_bsdfs.size()) - 1);
         ts[i] = embree::RTCTriangle(t.v0, t.v1, t.v2, i, 0);
     }
 
@@ -421,21 +539,44 @@ void TriangleMesh::prepareForRender()
         Vec3f p2 = _tfVerts[_tris[i].v2].pos();
         _totalArea += MathUtil::triangleArea(p0, p1, p2);
     }
+    _invArea = 1.0f/_totalArea;
 
     embree::rtcUnmapPositionBuffer(_geom);
     embree::rtcUnmapTriangleBuffer(_geom);
 
     embree::rtcBuildAccel(_geom, "objectsplit");
-    _intersector = embree::rtcQueryIntersector1(_geom, "fast.moeller");
+    if (_backfaceCulling)
+        _intersector = embree::rtcQueryIntersector1(_geom, "fast.moeller_cull");
+    else
+        _intersector = embree::rtcQueryIntersector1(_geom, "fast.moeller");
+
+    Primitive::prepareForRender();
 }
 
-void TriangleMesh::cleanupAfterRender()
+void TriangleMesh::teardownAfterRender()
 {
     if (_geom)
         embree::rtcDeleteGeometry(_geom);
     _geom = nullptr;
     _intersector = nullptr;
     _tfVerts.clear();
+
+    Primitive::teardownAfterRender();
+}
+
+int TriangleMesh::numBsdfs() const
+{
+    return _bsdfs.size();
+}
+
+std::shared_ptr<Bsdf> &TriangleMesh::bsdf(int index)
+{
+    return _bsdfs[index];
+}
+
+void TriangleMesh::setBsdf(int index, std::shared_ptr<Bsdf> &bsdf)
+{
+    _bsdfs[index] = bsdf;
 }
 
 Primitive *TriangleMesh::clone()

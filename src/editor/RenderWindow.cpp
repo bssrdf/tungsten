@@ -5,7 +5,8 @@
 #include "io/FileUtils.hpp"
 
 #include <string.h>
-#include <QtGui>
+#include <QTimer>
+#include <QtWidgets>
 
 namespace Tungsten {
 
@@ -14,7 +15,7 @@ RenderWindow::RenderWindow(QWidget *proxyParent, MainWindow *parent)
   _parent(*parent),
   _scene(nullptr),
   _rendering(false),
-  _currentSpp(0),
+  _autoRefresh(false),
   _zoom(1.0f),
   _panX(0.0f),
   _panY(0.0f),
@@ -28,8 +29,9 @@ RenderWindow::RenderWindow(QWidget *proxyParent, MainWindow *parent)
     new QShortcut(QKeySequence("+"), this, SLOT(zoomIn()));
     new QShortcut(QKeySequence("-"), this, SLOT(zoomOut()));
     new QShortcut(QKeySequence("F5"), this, SLOT(refresh()));
+    new QShortcut(QKeySequence("R"), this, SLOT(toggleAutoRefresh()));
     new QShortcut(QKeySequence("Home"), this, SLOT(resetView()));
-    new QShortcut(QKeySequence("Tab"), this, SLOT(togglePreview()));
+    new QShortcut(QKeySequence("Ctrl+Tab"), this, SLOT(togglePreview()));
 
     _sppLabel = new QLabel(this);
     _statusLabel = new QLabel(this);
@@ -88,12 +90,10 @@ void RenderWindow::wheelEvent(QWheelEvent *wheelEvent)
 void RenderWindow::sceneChanged()
 {
     _scene = _parent.scene();
-    if (_renderer)
-        _renderer->abortRender();
-    _renderer.reset();
+    if (_flattenedScene)
+        _flattenedScene->integrator().abortRender();
     _flattenedScene.reset();
     _rendering = false;
-    _currentSpp = 0;
 
     if (_scene) {
         Vec2u resolution = _scene->camera()->resolution();
@@ -105,24 +105,19 @@ void RenderWindow::sceneChanged()
 
 QRgb RenderWindow::tonemap(const Vec3f &c) const
 {
-    Vec3i pixel(min(c*_pow2Exposure*255.0f, Vec3f(255.0f)));
+    Vec3i pixel(clamp(c*_pow2Exposure*255.0f, Vec3f(0.0f), Vec3f(255.0f)));
 
     return qRgb(pixel.x(), pixel.y(), pixel.z());
-}
-
-uint32 RenderWindow::sampleStep(uint32 current, uint32 target) const
-{
-#if EXPORT_RAYS
-    return target - current;
-#else
-    return min(target - current, 4u);
-#endif
 }
 
 void RenderWindow::updateStatus()
 {
     if (_scene) {
-        _sppLabel->setText(QString("%1/%2 spp").arg(_currentSpp).arg(_scene->camera()->spp()));
+        int currentSpp = _flattenedScene ?
+                  _flattenedScene->integrator().currentSpp()
+                : _scene->rendererSettings().spp();
+
+        _sppLabel->setText(QString("%1/%2 spp").arg(currentSpp).arg(_scene->rendererSettings().spp()));
         if (_rendering)
             _statusLabel->setText("Rendering...");
         else
@@ -138,61 +133,52 @@ void RenderWindow::startRender()
     if (!_scene)
         return;
 
-    if (!_flattenedScene)
+    if (!_flattenedScene) {
         _flattenedScene.reset(_scene->makeTraceable());
+
+        _image->fill(Qt::black);
+        repaint();
+    }
 
     auto finishCallback = [&]() {
         emit rendererFinished();
     };
 
-    if (!_renderer) {
-        _currentSpp = 0;
-        _renderer.reset(new Renderer(*_flattenedScene));
-
-        _image->fill(Qt::black);
-        repaint();
-    }
-    _nextSpp = _currentSpp + sampleStep(_currentSpp, _scene->camera()->spp());
-    if (_nextSpp == _currentSpp)
-        return;
-    _renderer->startRender(finishCallback, _currentSpp, _nextSpp);
-
     _rendering = true;
     updateStatus();
+
+    _flattenedScene->integrator().startRender(finishCallback);
 }
 
 void RenderWindow::abortRender()
 {
     _rendering = false;
-    if (_renderer) {
-        _renderer->abortRender();
+    if (_flattenedScene) {
+        _flattenedScene->integrator().abortRender();
 
         refresh();
         updateStatus();
 
-        _renderer.reset();
         _flattenedScene.reset();
     }
 }
 
 void RenderWindow::finishRender()
 {
-    if (_renderer)
-        _renderer->waitForCompletion();
+    if (_flattenedScene)
+        _flattenedScene->integrator().waitForCompletion();
     if (!_rendering)
         return;
-    _currentSpp = _nextSpp;
     _rendering = false;
     refresh();
 
-    if (_scene && _currentSpp < _scene->camera()->spp())
+    if (_scene && !_flattenedScene->integrator().done())
         startRender();
     else {
         if (_scene) {
-            DirectoryChange context(FileUtils::extractParent(_scene->path()));
-            _scene->camera()->saveOutputs(*_renderer);
+            DirectoryChange context(_scene->path().parent());
+            _flattenedScene->integrator().saveOutputs();
         }
-        _renderer.reset();
         _flattenedScene.reset();
 
         updateStatus();
@@ -201,7 +187,7 @@ void RenderWindow::finishRender()
 
 void RenderWindow::refresh()
 {
-    if (!_image || !_renderer)
+    if (!_image || !_flattenedScene)
         return;
 
     uint32 w = _image->width(), h = _image->height();
@@ -212,6 +198,9 @@ void RenderWindow::refresh()
             pixels[idx] = tonemap(_scene->camera()->get(x, y));
 
     update();
+
+    if (_autoRefresh)
+        QTimer::singleShot(2000, this, SLOT(refresh()));
 }
 
 void RenderWindow::toggleRender()
@@ -245,6 +234,13 @@ void RenderWindow::togglePreview()
 {
     if (!_rendering)
         _parent.togglePreview();
+}
+
+void RenderWindow::toggleAutoRefresh()
+{
+    _autoRefresh = !_autoRefresh;
+    if (_autoRefresh)
+        QTimer::singleShot(2000, this, SLOT(refresh()));
 }
 
 }

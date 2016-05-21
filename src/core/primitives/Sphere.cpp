@@ -1,8 +1,11 @@
 #include "Sphere.hpp"
 #include "TriangleMesh.hpp"
 
-#include "sampling/SampleGenerator.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 #include "sampling/SampleWarp.hpp"
+
+#include "io/JsonObject.hpp"
+#include "io/Scene.hpp"
 
 namespace Tungsten {
 
@@ -18,9 +21,10 @@ Sphere::Sphere()
 }
 
 Sphere::Sphere(const Vec3f &pos, float r, const std::string &name, std::shared_ptr<Bsdf> bsdf)
-: Primitive(name, bsdf),
+: Primitive(name),
   _pos(pos),
-  _radius(r)
+  _radius(r),
+  _bsdf(std::move(bsdf))
 {
     _transform = Mat4f::translate(_pos)*Mat4f::scale(Vec3f(_radius));
 }
@@ -36,20 +40,28 @@ float Sphere::solidAngle(const Vec3f &p) const
 
 void Sphere::buildProxy()
 {
-    _proxy = std::make_shared<TriangleMesh>(std::vector<Vertex>(), std::vector<TriangleI>(), _bsdf, "Sphere", false);
+    _proxy = std::make_shared<TriangleMesh>(std::vector<Vertex>(), std::vector<TriangleI>(), _bsdf, "Sphere", false, false);
     _proxy->makeSphere(1.0f);
+}
+
+float Sphere::powerToRadianceFactor() const
+{
+    return INV_PI*_invArea;
 }
 
 void Sphere::fromJson(const rapidjson::Value &v, const Scene &scene)
 {
     Primitive::fromJson(v, scene);
+
+    _bsdf = scene.fetchBsdf(JsonUtils::fetchMember(v, "bsdf"));
 }
 
 rapidjson::Value Sphere::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Primitive::toJson(allocator);
-    v.AddMember("type", "sphere", allocator);
-    return std::move(v);
+    return JsonObject{Primitive::toJson(allocator), allocator,
+        "type", "sphere",
+        "bsdf", *_bsdf
+    };
 }
 
 bool Sphere::intersect(Ray &ray, IntersectionTemporary &data) const
@@ -111,6 +123,7 @@ void Sphere::intersectionInfo(const IntersectionTemporary &/*data*/, Intersectio
     if (std::isnan(info.uv.x()))
         info.uv.x() = 0.0f;
     info.primitive = this;
+    info.bsdf = _bsdf.get();
 }
 
 bool Sphere::tangentSpace(const IntersectionTemporary &/*data*/, const IntersectionInfo &info, Vec3f &T, Vec3f &B) const
@@ -126,43 +139,89 @@ bool Sphere::isSamplable() const
     return true;
 }
 
-void Sphere::makeSamplable()
+void Sphere::makeSamplable(const TraceableScene &/*scene*/, uint32 /*threadIndex*/)
 {
 }
 
-float Sphere::inboundPdf(const IntersectionTemporary &/*data*/, const Vec3f &p, const Vec3f &/*d*/) const
+bool Sphere::samplePosition(PathSampleGenerator &sampler, PositionSample &sample) const
 {
-    float dist = (_pos - p).length();
-    float cosTheta = std::sqrt(max(dist*dist - _radius*_radius, 0.0f))/dist;
-    return SampleWarp::uniformSphericalCapPdf(cosTheta);
+    Vec2f xi = sampler.next2D();
+    Vec3f localN = SampleWarp::uniformSphere(xi);
+    sample.Ng = _rot*localN;
+    sample.p = sample.Ng*_radius + _pos;
+    sample.pdf = _invArea;
+    sample.uv = Vec2f(xi.x() + 0.5f, std::acos(clamp(xi.y()*2.0f - 1.0f, -1.0f, 1.0f))*INV_PI);
+    if (sample.uv.x() > 1.0f)
+        sample.uv.x() -= 1.0f;
+    sample.weight = PI*_area*(*_emission)[sample.uv];
+
+    return true;
 }
 
-bool Sphere::sampleInboundDirection(LightSample &sample) const
+bool Sphere::sampleDirection(PathSampleGenerator &sampler, const PositionSample &point, DirectionSample &sample) const
 {
-    Vec3f L = _pos - sample.p;
+    Vec3f d = SampleWarp::cosineHemisphere(sampler.next2D());
+    sample.d = TangentFrame(point.Ng).toGlobal(d);
+    sample.weight = Vec3f(1.0f);
+    sample.pdf = SampleWarp::cosineHemispherePdf(d);
+
+    return true;
+}
+
+bool Sphere::sampleDirect(uint32 /*threadIndex*/, const Vec3f &p, PathSampleGenerator &sampler, LightSample &sample) const
+{
+    Vec3f L = _pos - p;
     float d = L.length();
+    float C = d*d - _radius*_radius;
+    if (C <= 0.0f)
+        return false;
+
     L.normalize();
-    float cosTheta = std::sqrt(max(d*d - _radius*_radius, 0.0f))/d;
-    sample.d = SampleWarp::uniformSphericalCap(sample.sampler->next2D(), cosTheta);
+    float cosTheta = std::sqrt(C)/d;
+    sample.d = SampleWarp::uniformSphericalCap(sampler.next2D(), cosTheta);
+
+    float B = d*sample.d.z();
+    float det = std::sqrt(max(B*B - C, 0.0f));
+    sample.dist = B - det;
 
     TangentFrame frame(L);
-    sample.dist = d;
     sample.d = frame.toGlobal(sample.d);
     sample.pdf = SampleWarp::uniformSphericalCapPdf(cosTheta);
 
     return true;
 }
 
-bool Sphere::sampleOutboundDirection(LightSample &sample) const
+float Sphere::positionalPdf(const PositionSample &/*point*/) const
 {
-    sample.p = SampleWarp::uniformSphere(sample.sampler->next2D());
-    sample.d = SampleWarp::cosineHemisphere(sample.sampler->next2D());
-    sample.pdf = SampleWarp::cosineHemispherePdf(sample.d)/(FOUR_PI*_radius*_radius);
-    TangentFrame frame(sample.p);
-    sample.d = frame.toGlobal(sample.d);
-    sample.p = sample.p*_radius + _pos;
+    return _invArea;
+}
 
-    return true;
+float Sphere::directionalPdf(const PositionSample &point, const DirectionSample &sample) const
+{
+    return max(sample.d.dot(point.Ng)*INV_PI, 0.0f);
+}
+
+float Sphere::directPdf(uint32 /*threadIndex*/, const IntersectionTemporary &/*data*/,
+        const IntersectionInfo &/*info*/, const Vec3f &p) const
+{
+    float dist = (_pos - p).length();
+    float cosTheta = std::sqrt(max(dist*dist - _radius*_radius, 0.0f))/dist;
+    return SampleWarp::uniformSphericalCapPdf(cosTheta);
+}
+
+Vec3f Sphere::evalPositionalEmission(const PositionSample &sample) const
+{
+    return PI*(*_emission)[sample.uv];
+}
+
+Vec3f Sphere::evalDirectionalEmission(const PositionSample &point, const DirectionSample &sample) const
+{
+    return Vec3f(max(sample.d.dot(point.Ng), 0.0f)*INV_PI);
+}
+
+Vec3f Sphere::evalDirect(const IntersectionTemporary &data, const IntersectionInfo &info) const
+{
+    return data.as<SphereIntersection>()->backSide ? Vec3f(0.0f) : (*_emission)[info.uv];
 }
 
 bool Sphere::invertParametrization(Vec2f uv, Vec3f &pos) const
@@ -174,7 +233,7 @@ bool Sphere::invertParametrization(Vec2f uv, Vec3f &pos) const
     return true;
 }
 
-bool Sphere::isDelta() const
+bool Sphere::isDirac() const
 {
     return false;
 }
@@ -184,7 +243,7 @@ bool Sphere::isInfinite() const
     return false;
 }
 
-float Sphere::approximateRadiance(const Vec3f &p) const
+float Sphere::approximateRadiance(uint32 /*threadIndex*/, const Vec3f &p) const
 {
     if (!isEmissive())
         return 0.0f;
@@ -209,10 +268,25 @@ void Sphere::prepareForRender()
     _radius = (_transform.extractScale()*Vec3f(1.0f)).max();
     _rot = _transform.extractRotation();
     _invRot = _rot.transpose();
+    _area = FOUR_PI*_radius*_radius;
+    _invArea = 1.0f/_area;
+
+    Primitive::prepareForRender();
 }
 
-void Sphere::cleanupAfterRender()
+int Sphere::numBsdfs() const
 {
+    return 1;
+}
+
+std::shared_ptr<Bsdf> &Sphere::bsdf(int /*index*/)
+{
+    return _bsdf;
+}
+
+void Sphere::setBsdf(int /*index*/, std::shared_ptr<Bsdf> &bsdf)
+{
+    _bsdf = bsdf;
 }
 
 Primitive *Sphere::clone()

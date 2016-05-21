@@ -2,31 +2,89 @@
 #include "FileUtils.hpp"
 
 #include "materials/BitmapTexture.hpp"
+#include "materials/IesTexture.hpp"
 
 namespace Tungsten {
 
-std::shared_ptr<BitmapTexture> &TextureCache::fetchTexture(const std::string &path, TexelConversion conversion)
+TextureCache::TextureCache()
+: _textures([](const BitmapKeyType &a, const BitmapKeyType &b) { return (!a || !b) ? a < b : (*a) < (*b); }),
+  _iesTextures([](const IesKeyType &a, const IesKeyType &b)    { return (!a || !b) ? a < b : (*a) < (*b); })
 {
-    KeyType key = std::make_pair(FileUtils::toAbsolutePath(path), conversion);
+}
+
+std::shared_ptr<BitmapTexture> TextureCache::fetchTexture(const rapidjson::Value &value, TexelConversion conversion,
+        const Scene *scene)
+{
+    BitmapKeyType key = std::make_shared<BitmapTexture>();
+    key->setTexelConversion(conversion);
+    key->fromJson(value, *scene);
+
     auto iter = _textures.find(key);
-
     if (iter == _textures.end())
-        iter = _textures.insert(std::make_pair(key, BitmapTexture::loadTexture(path, conversion))).first;
+        iter = _textures.insert(key).first;
 
-    if (!iter->second)
-        DBG("Unable to load texture at '%s'", path);
+    return *iter;
+}
 
-    return iter->second;
+std::shared_ptr<BitmapTexture> TextureCache::fetchTexture(PathPtr path, TexelConversion conversion,
+        bool gammaCorrect, bool linear, bool clamp)
+{
+    BitmapKeyType key = std::make_shared<BitmapTexture>(std::move(path),
+            conversion, gammaCorrect, linear, clamp);
+
+    auto iter = _textures.find(key);
+    if (iter == _textures.end())
+        iter = _textures.insert(key).first;
+
+    return *iter;
+}
+
+std::shared_ptr<IesTexture> TextureCache::fetchIesTexture(const rapidjson::Value &value, const Scene *scene)
+{
+    IesKeyType key = std::make_shared<IesTexture>();
+    key->fromJson(value, *scene);
+
+    auto iter = _iesTextures.find(key);
+    if (iter == _iesTextures.end())
+        iter = _iesTextures.insert(key).first;
+
+    return *iter;
+}
+
+std::shared_ptr<IesTexture> TextureCache::fetchIesTexture(PathPtr path, int resolution)
+{
+    IesKeyType key = std::make_shared<IesTexture>(std::move(path), resolution);
+
+    auto iter = _iesTextures.find(key);
+    if (iter == _iesTextures.end())
+        iter = _iesTextures.insert(key).first;
+
+    return *iter;
+}
+
+void TextureCache::loadResources()
+{
+    for (auto &i : _textures)
+        i->loadResources();
+    for (auto &i : _iesTextures)
+        i->loadResources();
+}
+
+template<typename T, typename Comparator>
+void pruneSet(std::set<std::shared_ptr<T>, Comparator> &set)
+{
+    for (auto i = set.cbegin(); i != set.cend();) {
+        if (i->use_count() == 1)
+            i = set.erase(i);
+        else
+            ++i;
+    }
 }
 
 void TextureCache::prune()
 {
-    for (auto i = _textures.cbegin(); i != _textures.cend();) {
-        if (i->second.use_count() == 1)
-            i = _textures.erase(i);
-        else
-            ++i;
-    }
+    pruneSet(_textures);
+    pruneSet(_iesTextures);
 }
 
 }

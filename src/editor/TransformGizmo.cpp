@@ -192,7 +192,7 @@ void TransformGizmo::drawStatic(AbstractPainter &painter)
 
     painter.setColor(Vec3f(0.0f));
     painter.drawEllipse(origin, Vec2f(4.0f), true);
-    painter.setColor(Vec3f(0.8f, 0.58f, 0.3f));
+    painter.setColor(Vec3f(0.61f, 0.3f, 0.07f));
     painter.drawEllipse(origin, Vec2f(3.0f), true);
 
     switch (_mode) {
@@ -281,15 +281,15 @@ void TransformGizmo::drawDynamic(AbstractPainter &painter)
         }
         break;
     } case MODE_ROTATE: {
-        painter.setColor(Vec4f(0.8f));
+        painter.setColor(Vec3f(0.61f));
         painter.drawLineStipple(current, oldOrigin, 20.0f, 2.0f);
-        painter.setColor(Vec4f(0.6f));
+        painter.setColor(Vec4f(0.32f, 0.32f, 0.32f, 0.8f));
         float aStart = std::atan2(   begin.y() - oldOrigin.y(),    begin.x() - oldOrigin.x());
         float aEnd   = std::atan2( current.y() - oldOrigin.y(),  current.x() - oldOrigin.x());
-        if (aStart > aEnd)
-            std::swap(aStart, aEnd);
         if (_snapToGrid)
             aEnd = snapToGrid(aEnd - aStart, Angle::degToRad(5.0f)) + aStart;
+        if (aStart > aEnd)
+            std::swap(aStart, aEnd);
         if (aEnd - aStart > PI) {
             std::swap(aEnd, aStart);
             aEnd += TWO_PI;
@@ -310,7 +310,7 @@ void TransformGizmo::drawDynamic(AbstractPainter &painter)
             painter.setColor(Vec3f(0.2f));
             painter.drawLine(q0, q1, 2.0f);
         }
-        painter.setColor(Vec4f(0.8f));
+        painter.setColor(Vec3f(0.61f));
         painter.drawLineStipple(current, oldOrigin, 20.0f, 2.0f);
         break;
     }}
@@ -358,7 +358,7 @@ bool TransformGizmo::update(const QMouseEvent *event)
     if (_transforming) {
         if (event->buttons() != Qt::NoButton && event->buttons() != Qt::LeftButton)
             abortTransform();
-        else if ((event->buttons() & Qt::LeftButton) != _needsMouseDown)
+        else if (bool(event->buttons() & Qt::LeftButton) != _needsMouseDown)
             endTransform();
         else
             updateTransform(event->pos().x(), event->pos().y());

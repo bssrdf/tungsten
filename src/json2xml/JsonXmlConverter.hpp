@@ -1,6 +1,9 @@
 #ifndef JSONXMLCONVERTER_HPP_
 #define JSONXMLCONVERTER_HPP_
 
+#include "phasefunctions/HenyeyGreensteinPhaseFunction.hpp"
+#include "phasefunctions/RayleighPhaseFunction.hpp"
+
 #include "primitives/InfiniteSphere.hpp"
 #include "primitives/TriangleMesh.hpp"
 #include "primitives/Sphere.hpp"
@@ -13,8 +16,8 @@
 #include "cameras/ThinlensCamera.hpp"
 #include "cameras/PinholeCamera.hpp"
 
-#include "volume/HomogeneousMedium.hpp"
-#include "volume/Medium.hpp"
+#include "media/HomogeneousMedium.hpp"
+#include "media/Medium.hpp"
 
 #include "bsdfs/RoughDielectricBsdf.hpp"
 #include "bsdfs/RoughConductorBsdf.hpp"
@@ -46,7 +49,7 @@ namespace Tungsten {
 
 class SceneXmlWriter
 {
-    std::string _folder;
+    Path _folder;
     std::ostream &_stream;
     std::string _indent;
     std::stack<std::string> _blocks;
@@ -203,7 +206,7 @@ class SceneXmlWriter
             assign("name", name);
         assign("type", "bitmap");
         beginPost();
-        convert("filename", c->path());
+        convert("filename", c->path()->asString());
         convert("filterType", "trilinear");
         end();
     }
@@ -241,17 +244,14 @@ class SceneXmlWriter
         else
             DBG("Unknown medium type!");
 
-        switch(med->phaseFunctionType()) {
-        case PhaseFunction::Isotropic:
-            break;
-        case PhaseFunction::HenyeyGreenstein:
+        const PhaseFunction *phase = med->phaseFunction(Vec3f(0.0f));
+        if (const HenyeyGreensteinPhaseFunction *hg = dynamic_cast<const HenyeyGreensteinPhaseFunction *>(phase)) {
             begin("phase");
             assign("type", "hg");
             beginPost();
-            convert("g", med->phaseG());
+            convert("g", hg->g());
             end();
-            break;
-        case PhaseFunction::Rayleigh:
+        } else if (dynamic_cast<const RayleighPhaseFunction *>(phase)) {
             begin("phase");
             assign("type", "rayleigh");
             endInline();
@@ -442,6 +442,14 @@ class SceneXmlWriter
 
     void convert(Bsdf *bsdf)
     {
+        bool hasBump = bsdf->bump() && !bsdf->bump()->isConstant();
+        if (hasBump) {
+            begin("bsdf");
+            assign("type", "bumpmap");
+            beginPost();
+            convert("map", bsdf->bump().get());
+        }
+
         if (LambertBsdf *bsdf2 = dynamic_cast<LambertBsdf *>(bsdf))
             convert(bsdf2);
         else if (PhongBsdf *bsdf2 = dynamic_cast<PhongBsdf *>(bsdf))
@@ -473,6 +481,9 @@ class SceneXmlWriter
         else if (dynamic_cast<ForwardBsdf *>(bsdf)) {
         } else
             DBG("Unknown bsdf type with name '%s'!", bsdf->name());
+
+        if (hasBump)
+            end();
     }
 
     void convert(PinholeCamera *cam)
@@ -510,7 +521,7 @@ class SceneXmlWriter
         else
             assign("type", "independent");
         beginPost();
-        convert("sampleCount", int(cam->spp()));
+        convert("sampleCount", int(_scene.rendererSettings().spp()));
         end();
 
         begin("film");
@@ -537,17 +548,17 @@ class SceneXmlWriter
         begin("shape");
         assign("type", "obj");
         beginPost();
-        std::string objFile(FileUtils::stripExt(prim->path()) + ".obj");
-        std::string fullObjFile;
+        Path objFile = prim->path()->setExtension(".obj");
+        Path fullObjFile;
         if (_folder.empty())
             fullObjFile = objFile;
         else {
-            fullObjFile = _folder + "/" + objFile;
-            if (!FileUtils::createDirectory(FileUtils::extractParent(fullObjFile)))
+            fullObjFile = _folder/objFile;
+            if (!FileUtils::createDirectory(fullObjFile.parent()))
                 DBG("Unable to create target folder for obj at: '%s'", fullObjFile);
         }
         prim->saveAsObj(fullObjFile);
-        convert("filename", objFile);
+        convert("filename", objFile.asString());
         convert("toWorld", prim->transform());
     }
 
@@ -583,7 +594,7 @@ class SceneXmlWriter
             assign("type", "envmap");
             beginPost();
             convert("toWorld", prim->transform()*Mat4f::rotXYZ(Vec3f(0.0f, 90.0f, 0.0f)));
-            convert("filename", FileUtils::stripExt(tex->path()) + ".hdr");
+            convert("filename", tex->path()->setExtension(".hdr").asString());
             end();
         } else {
             DBG("Infinite sphere has to be a constant or bitmap textured light source!");
@@ -592,6 +603,9 @@ class SceneXmlWriter
 
     void convert(Primitive *prim)
     {
+        if (prim->numBsdfs() > 1)
+            return; // Mitsuba does not support multiple BSDFs per primitive
+
         prim->prepareForRender();
 
         if (TriangleMesh *prim2 = dynamic_cast<TriangleMesh *>(prim))
@@ -606,25 +620,15 @@ class SceneXmlWriter
         } else
             DBG("Unknown primitive type!");
 
-        if (!dynamic_cast<ForwardBsdf *>(prim->bsdf().get())) {
-            bool hasBump = prim->bump() && !prim->bump()->isConstant();
-            if (hasBump) {
-                begin("bsdf");
-                assign("type", "bumpmap");
-                beginPost();
-                convert("map", prim->bump().get());
-            }
-            convertOrRef(prim->bsdf().get());
-            if (hasBump)
-                end();
+        if (!dynamic_cast<ForwardBsdf *>(prim->bsdf(0).get()))
+            convertOrRef(prim->bsdf(0).get());
+        if (prim->intMedium()) {
+            prim->intMedium()->setName("interior");
+            convert(prim->intMedium().get());
         }
-        if (prim->bsdf()->intMedium()) {
-            prim->bsdf()->intMedium()->setName("interior");
-            convert(prim->bsdf()->intMedium().get());
-        }
-        if (prim->bsdf()->extMedium()) {
-            prim->bsdf()->extMedium()->setName("exterior");
-            convert(prim->bsdf()->extMedium().get());
+        if (prim->extMedium()) {
+            prim->extMedium()->setName("exterior");
+            convert(prim->extMedium().get());
         }
         if (prim->isEmissive()) {
             begin("emitter");
@@ -664,8 +668,8 @@ class SceneXmlWriter
     }
 
 public:
-    SceneXmlWriter(const std::string &folder, Scene &scene, std::ostream &stream)
-    : _folder(FileUtils::stripSeparator(folder)),
+    SceneXmlWriter(const Path &folder, Scene &scene, std::ostream &stream)
+    : _folder(folder),
       _stream(stream),
       _scene(scene)
     {

@@ -21,6 +21,8 @@ public:
     virtual Vec3f eval(const SurfaceScatterEvent &event) const override;
     virtual float pdf(const SurfaceScatterEvent &event) const override;
 
+    virtual void prepareForRender() override;
+
     const std::shared_ptr<Texture> &opacity() const
     {
         return _opacity;
@@ -29,6 +31,16 @@ public:
     const std::shared_ptr<Bsdf> &base() const
     {
         return _base;
+    }
+
+    void setOpacity(const std::shared_ptr<Texture> &opacity)
+    {
+        _opacity = opacity;
+    }
+
+    void setBase(const std::shared_ptr<Bsdf> &base)
+    {
+        _base = base;
     }
 };
 

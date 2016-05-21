@@ -14,6 +14,7 @@ class CheckerTexture : public Texture
 
 public:
     CheckerTexture();
+    CheckerTexture(Vec3f onColor, Vec3f offColor, int resU, int resV);
 
     virtual void fromJson(const rapidjson::Value &v, const Scene &scene) override;
     virtual rapidjson::Value toJson(Allocator &allocator) const override;
@@ -24,12 +25,17 @@ public:
     virtual Vec3f minimum() const override;
     virtual Vec3f maximum() const override;
 
-    virtual Vec3f operator[](const Vec2f &uv) const override;
+    virtual Vec3f operator[](const Vec2f &uv) const override final;
+    virtual Vec3f operator[](const IntersectionInfo &info) const override;
     virtual void derivatives(const Vec2f &uv, Vec2f &derivs) const override;
 
     virtual void makeSamplable(TextureMapJacobian jacobian) override;
     virtual Vec2f sample(TextureMapJacobian jacobian, const Vec2f &uv) const override;
     virtual float pdf(TextureMapJacobian jacobian, const Vec2f &uv) const override;
+
+    virtual void scaleValues(float factor) override;
+
+    virtual Texture *clone() const override;
 
     Vec3f onColor() const
     {
@@ -49,6 +55,26 @@ public:
     int resV() const
     {
         return _resV;
+    }
+
+    void setOffColor(Vec3f offColor)
+    {
+        _offColor = offColor;
+    }
+
+    void setOnColor(Vec3f onColor)
+    {
+        _onColor = onColor;
+    }
+
+    void setResU(int resU)
+    {
+        _resU = resU;
+    }
+
+    void setResV(int resV)
+    {
+        _resV = resV;
     }
 };
 

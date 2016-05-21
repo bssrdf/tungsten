@@ -15,8 +15,6 @@ class SmoothCoatBsdf : public Bsdf
     float _avgTransmittance;
     Vec3f _scaledSigmaA;
 
-    void init();
-
 public:
     SmoothCoatBsdf();
 
@@ -28,19 +26,16 @@ public:
     virtual Vec3f eval(const SurfaceScatterEvent &event) const override;
     virtual float pdf(const SurfaceScatterEvent &event) const override;
 
+    virtual void prepareForRender() override;
+
     float ior() const
     {
         return _ior;
     }
 
-    const Vec3f &sigmaA() const
+    Vec3f sigmaA() const
     {
         return _sigmaA;
-    }
-
-    std::shared_ptr<Bsdf> &substrate()
-    {
-        return _substrate;
     }
 
     const std::shared_ptr<Bsdf> &substrate() const
@@ -51,6 +46,26 @@ public:
     float thickness() const
     {
         return _thickness;
+    }
+
+    void setIor(float ior)
+    {
+        _ior = ior;
+    }
+
+    void setSigmaA(Vec3f sigmaA)
+    {
+        _sigmaA = sigmaA;
+    }
+
+    void setSubstrate(const std::shared_ptr<Bsdf> &substrate)
+    {
+        _substrate = substrate;
+    }
+
+    void setThickness(float thickness)
+    {
+        _thickness = thickness;
     }
 };
 

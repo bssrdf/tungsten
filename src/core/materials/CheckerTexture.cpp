@@ -1,8 +1,10 @@
 #include "CheckerTexture.hpp"
 
+#include "primitives/IntersectionInfo.hpp"
+
 #include "math/MathUtil.hpp"
 
-#include "io/JsonUtils.hpp"
+#include "io/JsonObject.hpp"
 
 namespace Tungsten {
 
@@ -12,24 +14,30 @@ CheckerTexture::CheckerTexture()
 {
 }
 
+CheckerTexture::CheckerTexture(Vec3f onColor, Vec3f offColor, int resU, int resV)
+: _onColor(onColor), _offColor(offColor),
+  _resU(resU), _resV(resV)
+{
+}
+
 void CheckerTexture::fromJson(const rapidjson::Value &v, const Scene &scene)
 {
     Texture::fromJson(v, scene);
-    scalarOrVecFromJson(v, "onColor",   _onColor);
-    scalarOrVecFromJson(v, "offColor", _offColor);
-    JsonUtils::fromJson(v, "resU", _resU);
-    JsonUtils::fromJson(v, "resV", _resV);
+    scalarOrVecFromJson(v, "on_color",   _onColor);
+    scalarOrVecFromJson(v, "off_color", _offColor);
+    JsonUtils::fromJson(v, "res_u", _resU);
+    JsonUtils::fromJson(v, "res_v", _resV);
 }
 
 rapidjson::Value CheckerTexture::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Texture::toJson(allocator);
-    v.AddMember("type", "checker", allocator);
-    v.AddMember("onColor",  scalarOrVecToJson( _onColor, allocator), allocator);
-    v.AddMember("offColor", scalarOrVecToJson(_offColor, allocator), allocator);
-    v.AddMember("resU", _resU, allocator);
-    v.AddMember("resV", _resV, allocator);
-    return std::move(v);
+    return JsonObject{Texture::toJson(allocator), allocator,
+        "type", "checker",
+        "on_color",  scalarOrVecToJson( _onColor, allocator),
+        "off_color", scalarOrVecToJson(_offColor, allocator),
+        "res_u", _resU,
+        "res_v", _resV
+    };
 }
 
 bool CheckerTexture::isConstant() const
@@ -58,6 +66,11 @@ Vec3f CheckerTexture::operator[](const Vec2f &uv) const
     Vec2i uvI(uv*Vec2f(float(_resU), float(_resV)));
     bool on = (uvI.x() ^ uvI.y()) & 1;
     return on ? _onColor : _offColor;
+}
+
+Vec3f CheckerTexture::operator[](const IntersectionInfo &info) const
+{
+    return (*this)[info.uv];
 }
 
 void CheckerTexture::derivatives(const Vec2f &/*uv*/, Vec2f &derivs) const
@@ -107,6 +120,17 @@ float CheckerTexture::pdf(TextureMapJacobian /*jacobian*/, const Vec2f &uv) cons
     Vec2i uvI(uv*Vec2f(float(_resU), float(_resV)));
     bool on = (uvI.x() ^ uvI.y()) & 1;
     return (on ? onWeight : offWeight)/(onWeight + offWeight);
+}
+
+void CheckerTexture::scaleValues(float factor)
+{
+    _onColor *= factor;
+    _offColor *= factor;
+}
+
+Texture *CheckerTexture::clone() const
+{
+    return new CheckerTexture(*this);
 }
 
 }

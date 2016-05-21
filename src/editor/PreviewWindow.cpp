@@ -1,27 +1,25 @@
-#include <GL/glew.h>
 
 #include <QtCore/QtCore>
-#include <QtGui>
+#include <QtWidgets>
 
 #include "PreviewWindow.hpp"
 #include "ShapePainter.hpp"
 #include "MainWindow.hpp"
+#include "CoreProfileContext.hpp"
 
 #include "primitives/TriangleMesh.hpp"
 
 #include "cameras/Camera.hpp"
 
-#include "render/MatrixStack.hpp"
-#include "render/GLDebug.hpp"
+#include "opengl/OpenGL.hpp"
+#include "opengl/MatrixStack.hpp"
 
 #include "io/FileUtils.hpp"
 #include "io/ObjLoader.hpp"
 
 namespace Tungsten {
 
-CONSTEXPR float PreviewWindow::Fov;
-CONSTEXPR float PreviewWindow::Near;
-CONSTEXPR float PreviewWindow::Far;
+static const std::array<MouseConsumers, 3> DefaultPriorities{{GizmoConsumer, CameraConsumer, SelectionConsumer}};
 
 using namespace GL;
 
@@ -34,14 +32,18 @@ GlMesh::GlMesh(const TriangleMesh &src)
 
     _vertexBuffer.bind();
     VboVertex *verts = _vertexBuffer.map<VboVertex>();
-    for (const Vertex &v : src.verts())
-        *(verts++) = VboVertex{v.pos(), v.normal(), v.uv()};
+    for (const Vertex &v : src.verts()) {
+        VboVertex vert = {v.pos(), v.normal(), v.uv()};
+        *(verts++) = vert;
+    }
     _vertexBuffer.unmap();
 
     _indexBuffer.bind();
     VboTriangle *tris = _indexBuffer.map<VboTriangle>();
-    for (const TriangleI &t : src.tris())
-        *(tris++) = VboTriangle{t.v0, t.v1, t.v2};
+    for (const TriangleI &t : src.tris()) {
+        VboTriangle tri = {t.v0, t.v1, t.v2};
+        *(tris++) = tri;
+    }
     _indexBuffer.unmap();
 }
 
@@ -50,15 +52,27 @@ void GlMesh::draw(Shader &shader)
     _vertexBuffer.drawIndexed(_indexBuffer, shader, GL_TRIANGLES);
 }
 
-PreviewWindow::PreviewWindow(QWidget *proxyParent, MainWindow *parent, const QGLFormat &format)
-: QGLWidget(format, proxyParent),
+PreviewWindow::PreviewWindow(QWidget *proxyParent, MainWindow *parent)
+: QOpenGLWidget(parent),
   _parent(*parent),
   _scene(parent->scene()),
+  _selection(parent->selection()),
   _mousePriorities(DefaultPriorities),
   _rebuildMeshes(false)
 {
     setMouseTracking(true);
     setFocusPolicy(Qt::ClickFocus);
+
+    QSurfaceFormat fmt;
+    fmt.setMajorVersion(3);
+    fmt.setMinorVersion(2);
+    fmt.setProfile(QSurfaceFormat::CoreProfile);
+    fmt.setAlphaBufferSize(8);
+    fmt.setDepthBufferSize(24);
+    fmt.setSamples(4);
+    setFormat(fmt);
+
+    setUpdateBehavior(NoPartialUpdate);
 
     new QShortcut(QKeySequence("A"), this, SLOT(toggleSelectAll()));
     new QShortcut(QKeySequence("G"), this, SLOT(grabGizmo()));
@@ -69,7 +83,7 @@ PreviewWindow::PreviewWindow(QWidget *proxyParent, MainWindow *parent, const QGL
     new QShortcut(QKeySequence("Ctrl+D"), this, SLOT(duplicateSelection()));
     new QShortcut(QKeySequence("Ctrl+A"), this, SLOT(addModel()));
     new QShortcut(QKeySequence("Delete"), this, SLOT(deleteSelection()));
-    new QShortcut(QKeySequence("Tab"), this, SLOT(togglePreview()));
+    new QShortcut(QKeySequence("Ctrl+Tab"), this, SLOT(togglePreview()));
 
     QShortcut *tShortcut = new QShortcut(QKeySequence("W"), this);
     QShortcut *rShortcut = new QShortcut(QKeySequence("E"), this);
@@ -97,7 +111,7 @@ PreviewWindow::PreviewWindow(QWidget *proxyParent, MainWindow *parent, const QGL
     gizmoMapper->setMapping(zShortcut, 2);
     connect(gizmoMapper, SIGNAL(mapped(int)), &_gizmo, SLOT(fixAxis(int)));
     connect(lShortcut, SIGNAL(activated()), &_gizmo, SLOT(toggleTranslateLocal()));
-    connect(&_gizmo, SIGNAL(redraw()), this, SLOT(updateGL()));
+    connect(&_gizmo, SIGNAL(redraw()), this, SLOT(update()));
     connect(&_gizmo, SIGNAL(transformFinished(Mat4f)), this, SLOT(transformFinished(Mat4f)));
 }
 
@@ -109,8 +123,21 @@ void PreviewWindow::addStatusWidgets(QStatusBar *statusBar)
 void PreviewWindow::saveSceneData()
 {
     for (Primitive *p : _dirtyPrimitives)
-        p->saveData();
+        p->saveResources();
     _dirtyPrimitives.clear();
+}
+
+Mat4f PreviewWindow::projection() const
+{
+    float nearPlane = Near;
+    float farPlane = Far;
+    float radius = (_scene->camera()->pos() - _scene->camera()->lookAt()).length();
+    if (radius*2.0f > farPlane) {
+        farPlane = radius*2.0f;
+        nearPlane = Near/Far*farPlane;
+    }
+
+    return Mat4f::perspective(Fov, width()/float(height()), nearPlane, farPlane);
 }
 
 void PreviewWindow::rebuildMeshMap()
@@ -189,11 +216,11 @@ void PreviewWindow::pickPrimitive()
     _fbo->selectAttachments(1);
     _fbo->setReadBuffer(RT_ATTACHMENT0);
 
-    glViewport(0, 0, width(), height());
+    glf->glViewport(0, 0, width(), height());
 
-    glDisable(GL_MULTISAMPLE);
-    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glf->glDisable(GL_MULTISAMPLE);
+    glf->glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glf->glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     _solidShader->bind();
     renderMeshes(*_solidShader, [this](uint32 i) {
@@ -209,15 +236,15 @@ void PreviewWindow::pickPrimitive()
 
     int startX = clamp(min(_selectionState.endX, _selectionState.startX), 0, width() - 1);
     int startY = clamp(min(_selectionState.endY, _selectionState.startY), 0, height() - 1);
-    int w = min(std::abs(_selectionState.endX - _selectionState.startX), width() - startX);
-    int h = min(std::abs(_selectionState.endY - _selectionState.startY), height() - startY);
+    int w = clamp(std::abs(_selectionState.endX - _selectionState.startX), 1, width() - startX);
+    int h = clamp(std::abs(_selectionState.endY - _selectionState.startY), 1, height() - startY);
 
     std::unordered_set<uint32> uniquePixels;
-    std::vector<uint32> buffer(max(w, 1)*max(h, 1));
-    glReadPixels(startX, height() - startY - h - 1, max(w, 1), max(h, 1), GL_RGBA, GL_UNSIGNED_BYTE, &buffer[0]);
+    std::vector<uint32> buffer(w*h);
+    glf->glReadPixels(startX, height() - startY - h - 1, w, h, GL_RGBA, GL_UNSIGNED_BYTE, &buffer[0]);
 
     _fbo->unbind();
-    glEnable(GL_MULTISAMPLE);
+    glf->glEnable(GL_MULTISAMPLE);
 
     for (uint32 pixel : buffer) {
         if (pixel != 0xFFFFFFFF) {
@@ -227,7 +254,7 @@ void PreviewWindow::pickPrimitive()
     }
 
     if (_selectionState.shiftDown) {
-        if (w == 0 && h == 0 && !uniquePixels.empty()) {
+        if (w == 1 && h == 1 && !uniquePixels.empty()) {
             Primitive *prim = prims[*uniquePixels.begin()].get();
             if (_selection.count(prim))
                 _selection.erase(prim);
@@ -245,6 +272,8 @@ void PreviewWindow::pickPrimitive()
 
     _selectionState = SelectionState();
     updateFixedTransform();
+
+    emit selectionChanged();
 }
 
 bool PreviewWindow::handleSelection(QMouseEvent *event)
@@ -276,7 +305,8 @@ bool PreviewWindow::handleMouse(QMouseEvent *event)
             caughtMouse = updateViewTransform(event);
             break;
         case GizmoConsumer:
-            caughtMouse = _gizmo.update(event);
+            if (!_selection.empty())
+                caughtMouse = _gizmo.update(event);
             break;
         case SelectionConsumer:
             caughtMouse = handleSelection(event);
@@ -287,7 +317,7 @@ bool PreviewWindow::handleMouse(QMouseEvent *event)
             break;
         }
     }
-    updateGL();
+    update();
 
     if (!caughtMouse) {
         _mousePriorities = DefaultPriorities;
@@ -309,7 +339,9 @@ void PreviewWindow::toggleSelectAll()
     }
 
     updateFixedTransform();
-    updateGL();
+    update();
+
+    emit selectionChanged();
 }
 
 void PreviewWindow::grabGizmo()
@@ -325,7 +357,7 @@ void PreviewWindow::transformFinished(Mat4f delta)
     for (Primitive *e : _selection)
         e->setTransform(delta*e->transform());
     updateFixedTransform();
-    updateGL();
+    update();
 }
 
 void PreviewWindow::recomputeCentroids()
@@ -347,7 +379,7 @@ void PreviewWindow::recomputeCentroids()
 
     _rebuildMeshes = true;
     updateFixedTransform();
-    updateGL();
+    update();
 }
 
 void PreviewWindow::computeHardNormals()
@@ -355,7 +387,7 @@ void PreviewWindow::computeHardNormals()
     for (Primitive *e : _selection)
         if (TriangleMesh *m = dynamic_cast<TriangleMesh *>(e))
             m->setSmoothed(false);
-    updateGL();
+    update();
 }
 
 void PreviewWindow::computeSmoothNormals()
@@ -370,7 +402,7 @@ void PreviewWindow::computeSmoothNormals()
     }
 
     _rebuildMeshes = true;
-    updateGL();
+    update();
 }
 
 void PreviewWindow::freezeTransforms()
@@ -389,7 +421,7 @@ void PreviewWindow::freezeTransforms()
 
     _rebuildMeshes = true;
     updateFixedTransform();
-    updateGL();
+    update();
 }
 
 void PreviewWindow::duplicateSelection()
@@ -408,7 +440,10 @@ void PreviewWindow::duplicateSelection()
 
     rebuildMeshMap();
     updateFixedTransform();
-    updateGL();
+    update();
+
+    emit selectionChanged();
+    emit primitiveListChanged();
 }
 
 void PreviewWindow::deleteSelection()
@@ -419,7 +454,10 @@ void PreviewWindow::deleteSelection()
     _selection.clear();
     _gizmo.abortTransform();
     rebuildMeshMap();
-    updateGL();
+    update();
+
+    emit selectionChanged();
+    emit primitiveListChanged();
 }
 
 void PreviewWindow::addModel()
@@ -427,22 +465,36 @@ void PreviewWindow::addModel()
     if (!_scene)
         return;
 
+    Path dir = _scene->path().empty() ?
+        FileUtils::getCurrentDir() :
+        _scene->path();
     QString file = QFileDialog::getOpenFileName(
         nullptr,
         "Open file...",
-        QString::fromStdString(FileUtils::getCurrentDir()),
-        "Mesh files (*.obj;*.json)"
+        QString::fromStdString(dir.absolute().asString()),
+        "Mesh files (*.obj *.json)"
     );
 
     if (!file.isEmpty()) {
-        std::string p = file.toStdString();
-        std::string ext = FileUtils::extractExt(p);
+        Path p(file.toStdString());
 
         Scene *scene = nullptr;
-        if (ext == "obj")
-            scene = ObjLoader::load(p.c_str(), _scene->textureCache());
-        else if (ext == "json")
-            scene = Scene::load(p, _scene->textureCache());
+        try {
+            if (p.testExtension("obj")) {
+                scene = ObjLoader::load(p, _scene->textureCache());
+            } else if (p.testExtension("json")) {
+                scene = Scene::load(p, _scene->textureCache());
+                if (scene)
+                    scene->loadResources();
+            }
+
+        } catch (const std::runtime_error &e) {
+            QMessageBox::warning(
+                this,
+                "Loading model failed",
+                QString::fromStdString(tfm::format("Encountered an error while loading model:\n\n%s", e.what()))
+            );
+        }
         if (!scene)
             return;
 
@@ -460,7 +512,11 @@ void PreviewWindow::addModel()
         }
 
         rebuildMeshMap();
-        updateGL();
+        updateFixedTransform();
+        update();
+
+        emit selectionChanged();
+        emit primitiveListChanged();
     }
 }
 
@@ -472,11 +528,10 @@ void PreviewWindow::togglePreview()
 
 void PreviewWindow::initializeGL()
 {
-    glewExperimental = GL_TRUE;
-    glewInit();
-    glGetError();
+    GL::initOpenGL();
 
-    if (!QGLFormat::openGLVersionFlags().testFlag(QGLFormat::OpenGL_Version_3_2)) {
+    if (!(format().version() >= qMakePair(3, 2)) ||
+        !(QOpenGLContext::currentContext()->isValid())) {
         QMessageBox::critical(this,
                 "No OpenGL Support",
                 "This system does not appear to support OpenGL 3.2.\n\n"
@@ -487,23 +542,76 @@ void PreviewWindow::initializeGL()
     }
 
     GLuint vao;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
+    glf->glGenVertexArrays(1, &vao);
+    glf->glBindVertexArray(vao);
 
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LEQUAL);
+    glf->glEnable(GL_DEPTH_TEST);
+    glf->glDepthFunc(GL_LEQUAL);
 
     _fbo.reset(new RenderTarget());
 
-    std::string exePath = FileUtils::getExecutablePath();
-    std::string shaderBasePath = FileUtils::extractParent(exePath) + "/data/shaders/";
+    Path exePath = FileUtils::getExecutablePath();
+    Path shaderBasePath = exePath.parent()/"data/shaders/";
 
     _shader.reset(
-        new Shader(shaderBasePath.c_str(), "Preamble.txt", "MeshPreview.vert", "MeshPreview.geom", "MeshPreview.frag", 1));
+        new Shader(shaderBasePath, "Preamble.txt", "MeshPreview.vert", "MeshPreview.geom", "MeshPreview.frag", 1));
     _solidShader.reset(
-        new Shader(shaderBasePath.c_str(), "Preamble.txt", "SolidMesh.vert", nullptr, "SolidMesh.frag", 1));
+        new Shader(shaderBasePath, "Preamble.txt", "SolidMesh.vert", "", "SolidMesh.frag", 1));
     _wireframeShader.reset(
-        new Shader(shaderBasePath.c_str(), "Preamble.txt", "Wireframe.vert", "Wireframe.geom", "Wireframe.frag", 1));
+        new Shader(shaderBasePath, "Preamble.txt", "Wireframe.vert", "Wireframe.geom", "Wireframe.frag", 1));
+}
+
+void PreviewWindow::drawBackgroundGradient()
+{
+    float w = width();
+    float h = height();
+
+    glf->glDepthMask(GL_FALSE);
+
+    {
+        ShapePainter painter;
+        painter.begin(ShapePainter::MODE_QUADS);
+        painter.setColor(Vec3f(0.25f));
+        painter.addVertex(Vec2f(0.0f, 0.0f));
+        painter.addVertex(Vec2f(   w, 0.0f));
+        painter.setColor(Vec3f(0.3f));
+        painter.addVertex(Vec2f(   w,    h));
+        painter.addVertex(Vec2f(0.0f,    h));
+    }
+
+    glf->glDepthMask(GL_TRUE);
+}
+
+void PreviewWindow::drawGrid()
+{
+    Mat4f proj;
+    MatrixStack::set(MODEL_STACK, Mat4f());
+    MatrixStack::get(MODELVIEWPROJECTION_STACK, proj);
+
+    float radius = (_scene->camera()->pos() - _scene->camera()->lookAt()).length();
+    int exponent = max(int(std::log10(radius) + 0.5f), -10);
+    float scale = std::pow(10.0f, exponent);
+
+    ShapePainter painter(proj);
+    for (int i = -100; i <= 100; ++i) {
+        painter.setColor(Vec3f((i % 10) == 0 ? 0.0f : 0.2f));
+        float s = i*0.1f*scale;
+        float t = 10.0f*scale;
+        if (i == 0) {
+            painter.drawLine(Vec3f(s, 0.0f, -t), Vec3f(s, 0.0f, -scale));
+            painter.drawLine(Vec3f(s, 0.0f, scale), Vec3f(s, 0.0f, t));
+            painter.drawLine(Vec3f(-t, 0.0f, s), Vec3f(-scale, 0.0f, s));
+            painter.drawLine(Vec3f(scale, 0.0f, s), Vec3f(t, 0.0f, s));
+        } else {
+            painter.drawLine(Vec3f(s, 0.0f, -t), Vec3f(s, 0.0f, t));
+            painter.drawLine(Vec3f(-t, 0.0f, s), Vec3f(t, 0.0f, s));
+        }
+    }
+
+    painter.setColor(Vec3f(1.0f, 0.0f, 0.0f));
+    painter.drawLine(Vec3f(-scale, 0.0f, 0.0f), Vec3f(scale, 0.0f, 0.0f));
+    painter.setColor(Vec3f(0.0f, 0.0f, 1.0f));
+    painter.drawLine(Vec3f(0.0f, 0.0f, -scale), Vec3f(0.0f, 0.0f, scale));
 }
 
 void PreviewWindow::paintGL()
@@ -513,7 +621,7 @@ void PreviewWindow::paintGL()
         rebuildMeshMap();
     }
 
-    glViewport(0, 0, width(), height());
+    glf->glViewport(0, 0, width(), height());
     RenderTarget::resetViewport();
 
     if (!_screenBuffer && width() > 0 && height() > 0) {
@@ -525,11 +633,15 @@ void PreviewWindow::paintGL()
         _depthBuffer->init();
     }
 
-    if (_selectionState.finished && _scene)
+    if (_selectionState.finished && _scene) {
         pickPrimitive();
+        makeCurrent();
+    }
 
-    glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glf->glClearColor(0.5f, 0.5f, 0.5f, 1.0f);
+    glf->glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    drawBackgroundGradient();
 
     if (!_scene)
         return;
@@ -539,6 +651,10 @@ void PreviewWindow::paintGL()
     MatrixStack::set(VIEW_STACK, cam->transform());
     MatrixStack::set(PROJECTION_STACK, projection());
 
+    drawGrid();
+
+    glf->glEnable(GL_FRAMEBUFFER_SRGB);
+
     const std::vector<std::shared_ptr<Primitive>> &prims = _scene->primitives();
 
     _shader->bind();
@@ -547,9 +663,9 @@ void PreviewWindow::paintGL()
     _wireframeShader->uniformF("Resolution", width(), height());
     renderMeshes(*_wireframeShader, [&](size_t i) { return _selection.count(prims[i].get()) == 1; });
 
-    glDisable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glf->glDisable(GL_DEPTH_TEST);
+    glf->glEnable(GL_BLEND);
+    glf->glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     if (!_selection.empty())
         _gizmo.draw();
@@ -566,8 +682,10 @@ void PreviewWindow::paintGL()
         }
     }
 
-    glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
+    glf->glDisable(GL_BLEND);
+    glf->glEnable(GL_DEPTH_TEST);
+
+    glf->glDisable(GL_FRAMEBUFFER_SRGB);
 }
 
 void PreviewWindow::resizeGL(int width, int height)
@@ -578,7 +696,7 @@ void PreviewWindow::resizeGL(int width, int height)
         _screenBuffer.reset();
         _depthBuffer.reset();
     }
-    updateGL();
+    update();
 }
 
 void PreviewWindow::mouseMoveEvent(QMouseEvent *event)
@@ -609,15 +727,15 @@ void PreviewWindow::keyPressEvent(QKeyEvent *event)
         _gizmo.abortTransform();
         break;
     }
-    QGLWidget::keyPressEvent(event);
-    updateGL();
+    QOpenGLWidget::keyPressEvent(event);
+    update();
 }
 
 void PreviewWindow::keyReleaseEvent(QKeyEvent *event)
 {
     if (event->key() == Qt::Key_Control)
         _gizmo.setSnapToGrid(false);
-    QGLWidget::keyPressEvent(event);
+    QOpenGLWidget::keyPressEvent(event);
 }
 
 void PreviewWindow::showContextMenu()
@@ -655,7 +773,7 @@ void PreviewWindow::showContextMenu()
             updateFixedTransform();
 
             _rebuildMeshes = true;
-            updateGL();
+            update();
             return;
         }
     }
@@ -664,7 +782,6 @@ void PreviewWindow::showContextMenu()
 
 void PreviewWindow::sceneChanged()
 {
-    _selection.clear();
     _scene = _parent.scene();
 
     if (_scene) {
@@ -672,7 +789,13 @@ void PreviewWindow::sceneChanged()
         _rebuildMeshes = true;
     }
 
-    updateGL();
+    update();
+}
+
+void PreviewWindow::changeSelection()
+{
+    updateFixedTransform();
+    update();
 }
 
 }

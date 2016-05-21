@@ -6,7 +6,6 @@
 #include <memory>
 
 #include "renderer/TraceableScene.hpp"
-#include "renderer/Renderer.hpp"
 
 class QStatusBar;
 class QLabel;
@@ -23,13 +22,12 @@ class RenderWindow : public QWidget
     Scene *_scene;
 
     std::unique_ptr<QImage> _image;
-    std::unique_ptr<Renderer> _renderer;
     std::unique_ptr<TraceableScene> _flattenedScene;
 
     QLabel *_sppLabel, *_statusLabel;
 
     bool _rendering;
-    uint32 _currentSpp, _nextSpp;
+    bool _autoRefresh;
 
     float _zoom;
     QPoint _lastMousePos;
@@ -39,7 +37,6 @@ class RenderWindow : public QWidget
     float _gamma;
 
     QRgb tonemap(const Vec3f &c) const;
-    uint32 sampleStep(uint32 current, uint32 target) const;
 
     void updateStatus();
 
@@ -53,6 +50,7 @@ private slots:
     void zoomOut();
     void resetView();
     void togglePreview();
+    void toggleAutoRefresh();
 
 protected:
     virtual void paintEvent(QPaintEvent *event);

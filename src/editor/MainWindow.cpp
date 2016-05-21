@@ -1,7 +1,8 @@
-#include <QtGui>
+#include <QtWidgets>
 #include <iostream>
 
 #include "MainWindow.hpp"
+#include "PropertyWindow.hpp"
 #include "PreviewWindow.hpp"
 #include "RenderWindow.hpp"
 
@@ -16,38 +17,33 @@ MainWindow::MainWindow()
 {
     _scene.reset();
 
-    if (!QGLFormat::hasOpenGL()) {
-        QMessageBox::critical(this,
-                "No OpenGL Support",
-                "This system does not appear to support OpenGL.\n\n"
-                "The Tungsten scene editor requires OpenGL "
-                "to work properly. The editor will now terminate.\n\n"
-                "Please install any available updates for your graphics card driver and try again");
-        std::exit(0);
-    }
+    _windowSplit = new QSplitter(this);
+    _stackWidget = new QStackedWidget(_windowSplit);
 
-    QGLFormat qglFormat;
-    qglFormat.setVersion(3, 2);
-    qglFormat.setProfile(QGLFormat::CoreProfile);
-    qglFormat.setAlpha(true);
-    qglFormat.setSampleBuffers(true);
-    qglFormat.setSamples(16);
-
-    _stackWidget = new QStackedWidget(this);
-
-     _renderWindow = new  RenderWindow(_stackWidget, this);
-    _previewWindow = new PreviewWindow(_stackWidget, this, qglFormat);
+      _renderWindow = new   RenderWindow(_stackWidget, this);
+     _previewWindow = new  PreviewWindow(_stackWidget, this);
+    _propertyWindow = new PropertyWindow(_windowSplit, this);
 
     _stackWidget->addWidget(_renderWindow);
     _stackWidget->addWidget(_previewWindow);
 
-    setCentralWidget(_stackWidget);
+    _windowSplit->addWidget(_stackWidget);
+    _windowSplit->addWidget(_propertyWindow);
+    _windowSplit->setStretchFactor(0, 1);
+    _windowSplit->setStretchFactor(1, 0);
+
+    setCentralWidget(_windowSplit);
 
     _previewWindow->addStatusWidgets(statusBar());
      _renderWindow->addStatusWidgets(statusBar());
 
-    connect(this, SIGNAL(sceneChanged()), _previewWindow, SLOT(sceneChanged()));
-    connect(this, SIGNAL(sceneChanged()),  _renderWindow, SLOT(sceneChanged()));
+    connect(this, SIGNAL(sceneChanged()),  _previewWindow, SLOT(sceneChanged()));
+    connect(this, SIGNAL(sceneChanged()),   _renderWindow, SLOT(sceneChanged()));
+    connect(this, SIGNAL(sceneChanged()), _propertyWindow, SLOT(sceneChanged()));
+
+    connect( _previewWindow, SIGNAL(primitiveListChanged()), _propertyWindow, SLOT(primitiveListChanged()));
+    connect( _previewWindow, SIGNAL(selectionChanged()), _propertyWindow, SLOT(changeSelection()));
+    connect(_propertyWindow, SIGNAL(selectionChanged()),  _previewWindow, SLOT(changeSelection()));
 
     showPreview(true);
 
@@ -84,6 +80,7 @@ void MainWindow::showPreview(bool v)
 
 void MainWindow::newScene()
 {
+    _selection.clear();
     _scene.reset(new Scene());
     _scene->setCamera(new PinholeCamera());
     emit sceneChanged();
@@ -91,10 +88,13 @@ void MainWindow::newScene()
 
 void MainWindow::openScene()
 {
+    Path dir = (!_scene || _scene->path().empty()) ?
+            FileUtils::getCurrentDir() :
+            _scene->path();
     QString file = QFileDialog::getOpenFileName(
         nullptr,
         "Open file...",
-        QString::fromStdString(FileUtils::getCurrentDir()),
+        QString::fromStdString(dir.absolute().asString()),
         "Scene files (*.json)"
     );
 
@@ -105,14 +105,14 @@ void MainWindow::openScene()
 void MainWindow::reloadScene()
 {
     if (_scene)
-        openScene(QString::fromStdString(_scene->path()));
+        openScene(QString::fromStdString(_scene->path().absolute().asString()));
 }
 
 void MainWindow::openScene(const QString &path)
 {
     Scene *newScene = nullptr;
     try {
-        newScene = Scene::load(path.toStdString());
+        newScene = Scene::load(Path(path.toUtf8().data()));
     } catch (const std::runtime_error &e) {
         QMessageBox::warning(
             this,
@@ -122,13 +122,16 @@ void MainWindow::openScene(const QString &path)
     }
 
     if (newScene) {
+        _selection.clear();
         _scene.reset(newScene);
+        _scene->loadResources();
         emit sceneChanged();
     }
 }
 
 void MainWindow::closeScene()
 {
+    _selection.clear();
     _scene.reset();
     emit sceneChanged();
 }
@@ -136,25 +139,30 @@ void MainWindow::closeScene()
 void MainWindow::saveScene()
 {
     if (_scene) {
-        if (_scene->path().empty())
+        if (_scene->path().empty()) {
             saveSceneAs();
-        else
+        } else {
             Scene::save(_scene->path(), *_scene);
+            _previewWindow->saveSceneData();
+        }
     }
 }
 
 void MainWindow::saveSceneAs()
 {
     if (_scene) {
+        Path dir = _scene->path().empty() ?
+                FileUtils::getCurrentDir() :
+                _scene->path();
         QString file = QFileDialog::getSaveFileName(
             nullptr,
             "Save file as...",
-            QString::fromStdString(FileUtils::getCurrentDir()),
+            QString::fromStdString(dir.absolute().asString()),
             "Scene files (*.json)"
         );
 
         if (!file.isEmpty()) {
-            _scene->setPath(file.toStdString());
+            _scene->setPath(Path(file.toStdString()));
             saveScene();
         }
     }

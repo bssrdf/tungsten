@@ -11,7 +11,7 @@
 
 #include "cameras/Camera.hpp"
 
-#include "volume/Medium.hpp"
+#include "media/Medium.hpp"
 
 #include "RendererSettings.hpp"
 
@@ -35,20 +35,8 @@ class TraceableScene
     {
         const Primitive *primitive = reinterpret_cast<const Primitive *>(userData);
         PerRayData *data = reinterpret_cast<PerRayData *>(eRay.userData);
-//      if (primitive->needsRayTransform()) {
-//          Ray ray(fromERay(eRay));
-//          float length = ray.dir().length();
-//          ray.setDir(ray.dir()*(1.0f/length));
-//          ray.setNearT(ray.nearT()/length);
-//          ray.setFarT(ray.farT()/length);
-//          if (primitive->intersect(ray, data->data)) {
-//              data->ray.setFarT(ray.farT()*length);
-//              eRay.tfar = data->ray.farT();
-//          }
-//      } else {
-            if (primitive->intersect(data->ray, data->data))
-                eRay.tfar = data->ray.farT();
-//      }
+        if (primitive->intersect(data->ray, data->data))
+            eRay.tfar = data->ray.farT();
     }
 
     static bool occluded(const void *userData, embree::Ray &eRay)
@@ -60,25 +48,32 @@ class TraceableScene
     const float DefaultEpsilon = 5e-4f;
 
     Camera &_cam;
-    const Integrator &_integratorBase;
+    Integrator &_integrator;
     std::vector<std::shared_ptr<Primitive>> &_primitives;
+    std::vector<std::shared_ptr<Bsdf>> &_bsdfs;
     std::vector<std::shared_ptr<Medium>> &_media;
     std::vector<std::shared_ptr<Primitive>> _lights;
-    std::vector<std::shared_ptr<Primitive>> _infinites;
+    std::vector<std::shared_ptr<Primitive>> _infiniteLights;
+    std::vector<const Primitive *> _finites;
     RendererSettings _settings;
 
     embree::VirtualScene *_scene = nullptr;
     embree::Intersector1 *_intersector = nullptr;
     embree::Intersector1 _virtualIntersector;
 
+    Box3f _sceneBounds;
+
 public:
-    TraceableScene(Camera &cam, const Integrator &integratorBase,
+    TraceableScene(Camera &cam, Integrator &integrator,
             std::vector<std::shared_ptr<Primitive>> &primitives,
+            std::vector<std::shared_ptr<Bsdf>> &bsdfs,
             std::vector<std::shared_ptr<Medium>> &media,
-            RendererSettings settings)
+            RendererSettings settings,
+            uint32 seed)
     : _cam(cam),
-      _integratorBase(integratorBase),
+      _integrator(integrator),
       _primitives(primitives),
+      _bsdfs(bsdfs),
       _media(media),
       _settings(settings)
     {
@@ -86,78 +81,91 @@ public:
         _virtualIntersector.occludedPtr = &TraceableScene::occluded;
 
         _cam.prepareForRender();
+        _cam.requestOutputBuffers(_settings.renderOutputs());
 
         for (std::shared_ptr<Medium> &m : _media)
             m->prepareForRender();
+
+        for (std::shared_ptr<Bsdf> &b : _bsdfs)
+            b->prepareForRender();
 
         int finiteCount = 0, lightCount = 0;
         for (std::shared_ptr<Primitive> &m : _primitives) {
             m->prepareForRender();
+            for (int i = 0; i < m->numBsdfs(); ++i)
+                if (m->bsdf(i)->unnamed())
+                    m->bsdf(i)->prepareForRender();
 
-            if (m->isInfinite()) {
-                _infinites.push_back(m);
-            } else if (!m->isDelta()) {
+            if (!m->isDirac() && !m->isInfinite())
                 finiteCount++;
-            }
 
             if (m->isEmissive()) {
                 lightCount++;
-                m->makeSamplable();
                 if (m->isSamplable())
                     _lights.push_back(m);
+                if (m->isInfinite())
+                    _infiniteLights.push_back(m);
             }
         }
         if (lightCount == 0) {
-            std::shared_ptr<InfiniteSphere> defaultLight = std::make_shared<InfiniteSphere>();;
+            std::shared_ptr<InfiniteSphere> defaultLight = std::make_shared<InfiniteSphere>();
             defaultLight->setEmission(std::make_shared<ConstantTexture>(1.0f));
             _lights.push_back(defaultLight);
-            _infinites.push_back(defaultLight);
+            _infiniteLights.push_back(defaultLight);
         }
 
-        _scene = new embree::VirtualScene(finiteCount, "bvh2");
-        embree::VirtualScene::Object *objects = _scene->objects;
-        for (std::shared_ptr<Primitive> &m : _primitives) {
-            if (m->isInfinite() || m->isDelta())
-                continue;
+        if (_settings.useSceneBvh()) {
+            _scene = new embree::VirtualScene(finiteCount, "bvh2");
+            embree::VirtualScene::Object *objects = _scene->objects;
+            for (std::shared_ptr<Primitive> &m : _primitives) {
+                if (m->isInfinite() || m->isDirac())
+                    continue;
 
-            if (m->needsRayTransform()) {
-                objects->hasTransform = true;
-                objects->localBounds = EmbreeUtil::convert(m->bounds());
-                objects->local2world = EmbreeUtil::convert(m->transform());
-                objects->calculateWorldData();
-            } else {
+                Box3f primBounds = m->bounds();
+                _sceneBounds.grow(primBounds);
+
                 objects->hasTransform = false;
-                objects->localBounds = objects->worldBounds = EmbreeUtil::convert(m->bounds());
+                objects->localBounds = objects->worldBounds = EmbreeUtil::convert(primBounds);
+                objects->userData = m.get();
+                objects->intersector1 = &_virtualIntersector;
+                objects++;
             }
 
-            /* TODO: Transforms */
-            objects->userData = m.get();
-            objects->intersector1 = &_virtualIntersector;
-            objects++;
+            embree::rtcBuildAccel(_scene, "objectsplit");
+            _intersector = embree::rtcQueryIntersector1(_scene, "fast");
+        } else {
+            for (std::shared_ptr<Primitive> &m : _primitives) {
+                if (!m->isInfinite() && !m->isDirac()) {
+                    _sceneBounds.grow(m->bounds());
+                    _finites.push_back(m.get());
+                }
+            }
         }
 
-        embree::rtcBuildAccel(_scene, "objectsplit");
-        _intersector = embree::rtcQueryIntersector1(_scene, "fast");
+        _integrator.prepareForRender(*this, seed);
     }
 
     ~TraceableScene()
     {
+        _integrator.teardownAfterRender();
         _cam.teardownAfterRender();
 
         for (std::shared_ptr<Medium> &m : _media)
-            m->cleanupAfterRender();
+            m->teardownAfterRender();
 
-        for (std::shared_ptr<Primitive> &m : _primitives)
-            m->cleanupAfterRender();
+        for (std::shared_ptr<Bsdf> &b : _bsdfs)
+            b->teardownAfterRender();
+
+        for (std::shared_ptr<Primitive> &m : _primitives) {
+            m->teardownAfterRender();
+            for (int i = 0; i < m->numBsdfs(); ++i)
+                if (m->bsdf(i)->unnamed())
+                    m->bsdf(i)->teardownAfterRender();
+        }
 
         embree::rtcDeleteGeometry(_scene);
         _scene = nullptr;
         _intersector = nullptr;
-    }
-
-    Integrator *cloneThreadSafeIntegrator(uint32 threadId) const
-    {
-        return _integratorBase.cloneThreadSafe(threadId, this);
     }
 
     bool intersect(Ray &ray, IntersectionTemporary &data, IntersectionInfo &info) const
@@ -165,26 +173,22 @@ public:
         info.primitive = nullptr;
         data.primitive = nullptr;
 
-        PerRayData rayData{data, ray};
-        embree::Ray eRay(EmbreeUtil::convert(ray));
-        eRay.userData = &rayData;
+        if (_settings.useSceneBvh()) {
+            PerRayData rayData{data, ray};
+            embree::Ray eRay(EmbreeUtil::convert(ray));
+            eRay.userData = &rayData;
 
-        _intersector->intersect(eRay);
+            _intersector->intersect(eRay);
+        } else {
+            for (const Primitive *prim : _finites)
+                prim->intersect(ray, data);
+        }
 
         if (data.primitive) {
             info.p = ray.pos() + ray.dir()*ray.farT();
             info.w = ray.dir();
-//          if (data.primitive->needsRayTransform()) {
-//              Vec3f scale = data.primitive->transform().extractScaleVec();
-//              float diagScale = scale.avg();
-//              info.epsilon = DefaultEpsilon/diagScale;
-//              data.primitive->intersectionInfo(data, info);
-//              info.epsilon *= diagScale;
-//              info.Ng = data.primitive->transform()
-//          } else {
-                info.epsilon = DefaultEpsilon;
-                data.primitive->intersectionInfo(data, info);
-//          }
+            info.epsilon = DefaultEpsilon;
+            data.primitive->intersectionInfo(data, info);
             return true;
         } else {
             return false;
@@ -196,13 +200,11 @@ public:
         info.primitive = nullptr;
         data.primitive = nullptr;
 
-        for (const std::shared_ptr<Primitive> &p : _infinites)
+        for (const std::shared_ptr<Primitive> &p : _infiniteLights)
             p->intersect(ray, data);
 
         if (data.primitive) {
-            info.p = ray.pos() + ray.dir()*ray.farT();
             info.w = ray.dir();
-            info.epsilon = DefaultEpsilon;
             data.primitive->intersectionInfo(data, info);
             return true;
         } else {
@@ -216,9 +218,19 @@ public:
         return _intersector->occluded(eRay);
     }
 
+    const Box3f &bounds() const
+    {
+        return _sceneBounds;
+    }
+
     Camera &cam() const
     {
         return _cam;
+    }
+
+    Integrator &integrator() const
+    {
+        return _integrator;
     }
 
     const std::vector<std::shared_ptr<Primitive>> &primitives() const
@@ -226,9 +238,19 @@ public:
         return _primitives;
     }
 
+    std::vector<std::shared_ptr<Primitive>> &lights()
+    {
+        return _lights;
+    }
+
     const std::vector<std::shared_ptr<Primitive>> &lights() const
     {
         return _lights;
+    }
+
+    const std::vector<std::shared_ptr<Medium>> &media() const
+    {
+        return _media;
     }
 
     RendererSettings rendererSettings() const

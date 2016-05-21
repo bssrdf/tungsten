@@ -15,6 +15,7 @@ namespace Tungsten {
 
 template<typename ElementType, unsigned Size>
 class Vec {
+protected:
     std::array<ElementType, Size> _v;
 
 public:
@@ -30,7 +31,7 @@ public:
 
     template<typename... Ts>
     Vec(const ElementType &a, const ElementType &b, const Ts &... ts)
-    : _v({a, b, ts...})
+    : _v({{a, b, ts...}})
     {
     }
 
@@ -263,6 +264,22 @@ public:
         return result;
     }
 
+    Vec operator>>(const ElementType &a) const
+    {
+        Vec result;
+        for (unsigned i = 0; i < Size; ++i)
+            result._v[i] = _v[i] >> a;
+        return result;
+    }
+
+    Vec operator<<(const ElementType &a) const
+    {
+        Vec result;
+        for (unsigned i = 0; i < Size; ++i)
+            result._v[i] = _v[i] << a;
+        return result;
+    }
+
     Vec operator+=(const Vec &other)
     {
         for (unsigned i = 0; i < Size; ++i)
@@ -316,6 +333,20 @@ public:
     {
         for (unsigned i = 0; i < Size; ++i)
             _v[i] /= a;
+        return *this;
+    }
+
+    Vec operator>>=(const ElementType &a) const
+    {
+        for (unsigned i = 0; i < Size; ++i)
+            _v[i] >>= a;
+        return *this;
+    }
+
+    Vec operator<<=(const ElementType &a) const
+    {
+        for (unsigned i = 0; i < Size; ++i)
+            _v[i] <<= a;
         return *this;
     }
 
@@ -506,6 +537,19 @@ public:
 };
 
 template<unsigned Size>
+class hash<Tungsten::Vec<Tungsten::uint32, Size>>
+{
+public:
+    std::size_t operator()(const Tungsten::Vec<Tungsten::uint32, Size> &v) const {
+        // See http://www.boost.org/doc/libs/1_33_1/doc/html/hash_combine.html
+        Tungsten::uint32 result = 0;
+        for (unsigned i = 0; i < Size; ++i)
+            result ^= v[i] + 0x9E3779B9 + (result << 6) + (result >> 2);
+        return result;
+    }
+};
+
+template<unsigned Size>
 class hash<Tungsten::Vec<Tungsten::int32, Size>>
 {
 public:
@@ -513,7 +557,7 @@ public:
         // See http://www.boost.org/doc/libs/1_33_1/doc/html/hash_combine.html
         Tungsten::uint32 result = 0;
         for (unsigned i = 0; i < Size; ++i)
-            result ^= v[i] + 0x9E3779B9 + (result << 6) + (result >> 2);
+            result ^= static_cast<Tungsten::uint32>(v[i]) + 0x9E3779B9 + (result << 6) + (result >> 2);
         return result;
     }
 };

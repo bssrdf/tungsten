@@ -1,36 +1,35 @@
 #include "Camera.hpp"
 
-#include "renderer/Renderer.hpp"
-
 #include "math/Angle.hpp"
 #include "math/Ray.hpp"
 
+#include "io/JsonObject.hpp"
 #include "io/FileUtils.hpp"
-#include "io/JsonUtils.hpp"
-#include "io/ImageIO.hpp"
 #include "io/Scene.hpp"
 
+#include <iostream>
 #include <cmath>
 
 namespace Tungsten {
 
 // Default to low-res 16:9
 Camera::Camera()
-: Camera(Mat4f(), Vec2u(1000u, 563u), 32)
+: Camera(Mat4f(), Vec2u(1000u, 563u))
 {
 }
 
-Camera::Camera(const Mat4f &transform, const Vec2u &res, uint32 spp)
-: _outputFile("TungstenRender.png"),
-  _tonemapString("gamma"),
-  _overwriteOutputFiles(false),
+Camera::Camera(const Mat4f &transform, const Vec2u &res)
+: _tonemapString("gamma"),
   _transform(transform),
-  _res(res),
-  _spp(spp)
+  _res(res)
 {
+    _colorBufferSettings.setType(OutputColor);
+
     _pos    = _transform*Vec3f(0.0f, 0.0f, 2.0f);
     _lookAt = _transform*Vec3f(0.0f, 0.0f, -1.0f);
     _up     = _transform*Vec3f(0.0f, 1.0f, 0.0f);
+
+    _transform.setRight(-_transform.right());
 
     precompute();
 }
@@ -39,109 +38,141 @@ void Camera::precompute()
 {
     _tonemapOp = Tonemap::stringToType(_tonemapString);
     _ratio = _res.y()/float(_res.x());
-    _pixelSize = Vec2f(2.0f/_res.x(), 2.0f/_res.x());
-    _transform = Mat4f::lookAt(_pos, _lookAt - _pos, _up);
+    _pixelSize = Vec2f(1.0f/_res.x(), 1.0f/_res.y());
     _invTransform = _transform.pseudoInvert();
-}
-
-std::string Camera::incrementalFilename(const std::string &dstFile, const std::string &suffix) const
-{
-    std::string dstPath = FileUtils::stripExt(dstFile) + suffix + "." + FileUtils::extractExt(dstFile);
-    if (_overwriteOutputFiles)
-        return std::move(dstPath);
-
-    std::string barePath = FileUtils::stripExt(dstPath);
-    std::string extension = FileUtils::extractExt(dstPath);
-
-    int index = 0;
-    while (FileUtils::fileExists(dstPath))
-        dstPath = tfm::format("%s%05d.%s", barePath, ++index, extension);
-
-    return std::move(dstPath);
-}
-
-void Camera::saveBuffers(Renderer &renderer, const std::string &suffix) const
-{
-    std::unique_ptr<Vec3f[]> hdr(new Vec3f[_res.x()*_res.y()]);
-    std::unique_ptr<Vec3c[]> ldr(new Vec3c[_res.x()*_res.y()]);
-
-    for (uint32 y = 0; y < _res.y(); ++y) {
-        for (uint32 x = 0; x < _res.x(); ++x) {
-            hdr[x + y*_res.x()] = getLinear(x, y);
-            ldr[x + y*_res.x()] = Vec3c(clamp(Vec3i(get(x, y)*255.0f), Vec3i(0), Vec3i(255)));
-        }
-    }
-
-    if (!_outputFile.empty())
-        ImageIO::saveLdr(incrementalFilename(_outputFile, suffix), &ldr[0].x(), _res.x(), _res.y(), 3);
-    if (!_hdrOutputFile.empty())
-        ImageIO::saveHdr(incrementalFilename(_hdrOutputFile, suffix), &hdr[0].x(), _res.x(), _res.y(), 3);
-
-    if (!_varianceOutputFile.empty()) {
-        std::vector<float> variance;
-        int varianceW, varianceH;
-        renderer.getVarianceImage(variance, varianceW, varianceH);
-
-        std::unique_ptr<uint8[]> ldrVariance(new uint8[_res.x()*_res.y()]);
-        for (int y = 0; y < varianceH; ++y)
-            for (int x = 0; x < varianceW; ++x)
-                ldrVariance[x + y*varianceW] = clamp(int(variance[x + y*varianceW]*255.0f), 0, 255);
-
-        ImageIO::saveLdr(incrementalFilename(_varianceOutputFile, suffix), ldrVariance.get(), varianceW, varianceH, 1);
-    }
 }
 
 void Camera::fromJson(const rapidjson::Value &v, const Scene &scene)
 {
-    JsonUtils::fromJson(v, "output_file", _outputFile);
-    JsonUtils::fromJson(v, "hdr_output_file", _hdrOutputFile);
-    JsonUtils::fromJson(v, "variance_output_file", _varianceOutputFile);
-    JsonUtils::fromJson(v, "overwrite_output_files", _overwriteOutputFiles);
+    auto medium    = v.FindMember("medium");
+    auto filter    = v.FindMember("reconstruction_filter");
+    auto transform = v.FindMember("transform");
+
     JsonUtils::fromJson(v, "tonemap", _tonemapString);
-    JsonUtils::fromJson(v, "position", _pos);
-    JsonUtils::fromJson(v, "lookAt", _lookAt);
-    JsonUtils::fromJson(v, "up", _up);
     JsonUtils::fromJson(v, "resolution", _res);
-    JsonUtils::fromJson(v, "spp", _spp);
-    if (const rapidjson::Value::Member *medium = v.FindMember("medium"))
+    if (medium != v.MemberEnd())
         _medium = scene.fetchMedium(medium->value);
+    if (filter != v.MemberEnd())
+        if (filter->value.IsString())
+            _filter = ReconstructionFilter(filter->value.GetString());
+
+    if (transform != v.MemberEnd()) {
+        JsonUtils::fromJson(transform->value, _transform);
+        _pos    = _transform.extractTranslationVec();
+        _lookAt = _transform.fwd() + _pos;
+        _up     = _transform.up();
+
+        if (transform->value.IsObject()) {
+            JsonUtils::fromJson(transform->value, "up", _up);
+            JsonUtils::fromJson(transform->value, "look_at", _lookAt);
+        }
+
+        _transform.setRight(-_transform.right());
+    }
 
     precompute();
 }
 
 rapidjson::Value Camera::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = JsonSerializable::toJson(allocator);
-    if (!_outputFile.empty())
-        v.AddMember("output_file", _outputFile.c_str(), allocator);
-    if (!_hdrOutputFile.empty())
-        v.AddMember("hdr_output_file", _hdrOutputFile.c_str(), allocator);
-    if (!_varianceOutputFile.empty())
-        v.AddMember("variance_output_file", _varianceOutputFile.c_str(), allocator);
-    v.AddMember("overwrite_output_files", _overwriteOutputFiles, allocator);
-    v.AddMember("tonemap", _tonemapString.c_str(), allocator);
-    v.AddMember("position", JsonUtils::toJsonValue<float, 3>(_pos,    allocator), allocator);
-    v.AddMember("lookAt",   JsonUtils::toJsonValue<float, 3>(_lookAt, allocator), allocator);
-    v.AddMember("up",       JsonUtils::toJsonValue<float, 3>(_up,     allocator), allocator);
-    v.AddMember("resolution", JsonUtils::toJsonValue<uint32, 2>(_res, allocator), allocator);
-    v.AddMember("spp", _spp, allocator);
+    JsonObject result{JsonSerializable::toJson(allocator), allocator,
+        "tonemap", _tonemapString,
+        "resolution", _res,
+        "reconstruction_filter", _filter.name(),
+        "transform", JsonObject{allocator,
+            "position", _pos,
+            "look_at", _lookAt,
+            "up", _up
+        }
+    };
     if (_medium)
-        JsonUtils::addObjectMember(v, "medium", *_medium,  allocator);
-    return std::move(v);
+        result.add("medium", *_medium);
+
+    return result;
+}
+
+bool Camera::samplePosition(PathSampleGenerator &/*sampler*/, PositionSample &/*sample*/) const
+{
+    return false;
+}
+
+bool Camera::sampleDirection(PathSampleGenerator &/*sampler*/, const PositionSample &/*point*/,
+        DirectionSample &/*sample*/) const
+{
+    return false;
+}
+
+bool Camera::sampleDirection(PathSampleGenerator &/*sampler*/, const PositionSample &/*point*/, Vec2u /*pixel*/,
+        DirectionSample &/*sample*/) const
+{
+    return false;
+}
+
+bool Camera::sampleDirect(const Vec3f &/*p*/, PathSampleGenerator &/*sampler*/, LensSample &/*sample*/) const
+{
+    return false;
+}
+
+bool Camera::evalDirection(PathSampleGenerator &/*sampler*/, const PositionSample &/*point*/,
+        const DirectionSample &/*direction*/, Vec3f &/*weight*/, Vec2f &/*pixel*/) const
+{
+    return false;
+}
+
+float Camera::directionPdf(const PositionSample &/*point*/, const DirectionSample &/*direction*/) const
+{
+    return 0.0f;
 }
 
 void Camera::prepareForRender()
 {
-    _pixels.resize(_res.x()*_res.y(), Vec3d(0.0));
-    _weights.resize(_res.x()*_res.y(), 0.0);
+    precompute();
 }
 
 void Camera::teardownAfterRender()
 {
-    _pixels.clear();
-    _weights.clear();
-    _pixels.shrink_to_fit();
-    _weights.shrink_to_fit();
+         _colorBuffer.reset();
+         _depthBuffer.reset();
+        _normalBuffer.reset();
+        _albedoBuffer.reset();
+    _visibilityBuffer.reset();
+
+    _splatBuffer.reset();
+}
+
+void Camera::requestOutputBuffers(const std::vector<OutputBufferSettings> &settings)
+{
+    for (const auto &b : settings) {
+        switch (b.type()) {
+        case OutputColor:           _colorBuffer.reset(new OutputBufferVec3f(_res, b)); break;
+        case OutputDepth:           _depthBuffer.reset(new OutputBufferF    (_res, b)); break;
+        case OutputNormal:         _normalBuffer.reset(new OutputBufferVec3f(_res, b)); break;
+        case OutputAlbedo:         _albedoBuffer.reset(new OutputBufferVec3f(_res, b)); break;
+        case OutputVisibility: _visibilityBuffer.reset(new OutputBufferF    (_res, b)); break;
+        default: break;
+        }
+    }
+}
+
+void Camera::requestColorBuffer()
+{
+    if (!_colorBuffer)
+        _colorBuffer.reset(new OutputBufferVec3f(_res, _colorBufferSettings));
+    _colorBufferWeight = 1.0;
+}
+
+void Camera::requestSplatBuffer()
+{
+    _splatBuffer.reset(new AtomicFramebuffer(_res.x(), _res.y(), _filter));
+    _splatWeight = 1.0;
+}
+
+void Camera::blitSplatBuffer()
+{
+    for (uint32 y = 0; y < _res.y(); ++y)
+        for (uint32 x = 0; x < _res.x(); ++x)
+            _colorBuffer->addSample(Vec2u(x, y), _splatBuffer->get(x, y));
+    _splatBuffer->unsafeReset();
 }
 
 void Camera::setTransform(const Vec3f &pos, const Vec3f &lookAt, const Vec3f &up)
@@ -149,35 +180,56 @@ void Camera::setTransform(const Vec3f &pos, const Vec3f &lookAt, const Vec3f &up
     _pos = pos;
     _lookAt = lookAt;
     _up = up;
+    _transform = Mat4f::lookAt(_pos, _lookAt - _pos, _up);
     precompute();
 }
 
 void Camera::setPos(const Vec3f &pos)
 {
     _pos = pos;
+    _transform = Mat4f::lookAt(_pos, _lookAt - _pos, _up);
     precompute();
 }
 
 void Camera::setLookAt(const Vec3f &lookAt)
 {
     _lookAt = lookAt;
+    _transform = Mat4f::lookAt(_pos, _lookAt - _pos, _up);
     precompute();
 }
 
 void Camera::setUp(const Vec3f &up)
 {
     _up = up;
+    _transform = Mat4f::lookAt(_pos, _lookAt - _pos, _up);
     precompute();
 }
 
-void Camera::saveOutputs(Renderer &renderer) const
+void Camera::saveOutputBuffers() const
 {
-    saveBuffers(renderer, "");
+    if (     _colorBuffer)      _colorBuffer->save();
+    if (     _depthBuffer)      _depthBuffer->save();
+    if (    _normalBuffer)     _normalBuffer->save();
+    if (    _albedoBuffer)     _albedoBuffer->save();
+    if (_visibilityBuffer) _visibilityBuffer->save();
 }
 
-void Camera::saveCheckpoint(Renderer &renderer) const
+void Camera::serializeOutputBuffers(OutputStreamHandle &out) const
 {
-    saveBuffers(renderer, "_checkpoint");
+    if (     _colorBuffer)      _colorBuffer->serialize(out);
+    if (     _depthBuffer)      _depthBuffer->serialize(out);
+    if (    _normalBuffer)     _normalBuffer->serialize(out);
+    if (    _albedoBuffer)     _albedoBuffer->serialize(out);
+    if (_visibilityBuffer) _visibilityBuffer->serialize(out);
+}
+
+void Camera::deserializeOutputBuffers(InputStreamHandle &in)
+{
+    if (     _colorBuffer)      _colorBuffer->deserialize(in);
+    if (     _depthBuffer)      _depthBuffer->deserialize(in);
+    if (    _normalBuffer)     _normalBuffer->deserialize(in);
+    if (    _albedoBuffer)     _albedoBuffer->deserialize(in);
+    if (_visibilityBuffer) _visibilityBuffer->deserialize(in);
 }
 
 }

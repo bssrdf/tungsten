@@ -3,9 +3,9 @@
 
 #include "materials/ConstantTexture.hpp"
 
-#include "sampling/UniformSampler.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 
-#include "io/JsonUtils.hpp"
+#include "io/JsonObject.hpp"
 #include "io/Scene.hpp"
 
 namespace Tungsten {
@@ -23,12 +23,6 @@ RoughDielectricBsdf::RoughDielectricBsdf()
   _enableT(true)
 {
     _lobes = BsdfLobes(BsdfLobes::GlossyReflectionLobe | BsdfLobes::GlossyTransmissionLobe);
-    init();
-}
-
-void RoughDielectricBsdf::init()
-{
-    _distribution = Microfacet::stringToType(_distributionName);
 }
 
 void RoughDielectricBsdf::fromJson(const rapidjson::Value &v, const Scene &scene)
@@ -45,18 +39,19 @@ void RoughDielectricBsdf::fromJson(const rapidjson::Value &v, const Scene &scene
     else
         _lobes = BsdfLobes(BsdfLobes::GlossyReflectionLobe);
 
-    init();
+    // Fail early in case of invalid distribution name
+    prepareForRender();
 }
 
 rapidjson::Value RoughDielectricBsdf::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Bsdf::toJson(allocator);
-    v.AddMember("type", "rough_dielectric", allocator);
-    v.AddMember("ior", _ior, allocator);
-    v.AddMember("distribution", _distributionName.c_str(), allocator);
-    v.AddMember("enable_refraction", _enableT, allocator);
-    JsonUtils::addObjectMember(v, "roughness", *_roughness, allocator);
-    return std::move(v);
+    return JsonObject{Bsdf::toJson(allocator), allocator,
+        "type", "rough_dielectric",
+        "ior", _ior,
+        "distribution", _distributionName,
+        "enable_refraction", _enableT,
+        "roughness", *_roughness
+    };
 }
 
 bool RoughDielectricBsdf::sampleBase(SurfaceScatterEvent &event, bool sampleR, bool sampleT,
@@ -83,7 +78,7 @@ bool RoughDielectricBsdf::sampleBase(SurfaceScatterEvent &event, bool sampleR, b
 
     bool reflect;
     if (sampleR && sampleT) {
-        reflect = event.supplementalSampler->next1D() < F;
+        reflect = event.sampler->nextBoolean(F);
     } else if (sampleT) {
         if (F == 1.0f)
             return false;
@@ -112,7 +107,7 @@ bool RoughDielectricBsdf::sampleBase(SurfaceScatterEvent &event, bool sampleR, b
     float woDotM = event.wo.dot(m);
     float G = Microfacet::G(distribution, alpha, event.wi, event.wo, m);
     float D = Microfacet::D(distribution, alpha, m);
-    event.throughput = Vec3f(std::abs(wiDotM)*G*D/(std::abs(wiDotN)*pm));
+    event.weight = Vec3f(std::abs(wiDotM)*G*D/(std::abs(wiDotN)*pm));
 
     if (reflect) {
         event.pdf = pm*0.25f/std::abs(wiDotM);
@@ -129,9 +124,9 @@ bool RoughDielectricBsdf::sampleBase(SurfaceScatterEvent &event, bool sampleR, b
             event.pdf *= 1.0f - F;
     } else {
         if (reflect)
-            event.throughput *= F;
+            event.weight *= F;
         else
-            event.throughput *= 1.0f - F;
+            event.weight *= 1.0f - F;
     }
 
     return true;
@@ -212,27 +207,43 @@ bool RoughDielectricBsdf::sample(SurfaceScatterEvent &event) const
 {
     bool sampleR = event.requestedLobe.test(BsdfLobes::GlossyReflectionLobe);
     bool sampleT = event.requestedLobe.test(BsdfLobes::GlossyTransmissionLobe) && _enableT;
-    float roughness = (*_roughness)[event.info->uv].x();
+    float roughness = (*_roughness)[*event.info].x();
 
-    return sampleBase(event, sampleR, sampleT, roughness, _ior, _distribution);
+    bool result = sampleBase(event, sampleR, sampleT, roughness, _ior, _distribution);
+    event.weight *= albedo(event.info);
+    return result;
 }
 
 Vec3f RoughDielectricBsdf::eval(const SurfaceScatterEvent &event) const
 {
     bool sampleR = event.requestedLobe.test(BsdfLobes::GlossyReflectionLobe);
     bool sampleT = event.requestedLobe.test(BsdfLobes::GlossyTransmissionLobe) && _enableT;
-    float roughness = (*_roughness)[event.info->uv].x();
+    float roughness = (*_roughness)[*event.info].x();
 
-    return evalBase(event, sampleR, sampleT, roughness, _ior, _distribution);
+    return evalBase(event, sampleR, sampleT, roughness, _ior, _distribution)*albedo(event.info);
 }
 
 float RoughDielectricBsdf::pdf(const SurfaceScatterEvent &event) const
 {
     bool sampleR = event.requestedLobe.test(BsdfLobes::GlossyReflectionLobe);
     bool sampleT = event.requestedLobe.test(BsdfLobes::GlossyTransmissionLobe) && _enableT;
-    float roughness = (*_roughness)[event.info->uv].x();
+    float roughness = (*_roughness)[*event.info].x();
 
     return pdfBase(event, sampleR, sampleT, roughness, _ior, _distribution);
+}
+
+float RoughDielectricBsdf::eta(const SurfaceScatterEvent &event) const
+{
+    if (event.wi.z()*event.wo.z() >= 0.0f)
+        return 1.0f;
+    else
+        return event.wi.z() < 0.0f ? _ior : _invIor;
+}
+
+void RoughDielectricBsdf::prepareForRender()
+{
+    _distribution = Microfacet::stringToType(_distributionName);
+    _invIor = 1.0f/_ior;
 }
 
 }

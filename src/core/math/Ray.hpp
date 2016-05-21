@@ -5,6 +5,8 @@
 #include "Angle.hpp"
 #include "Vec.hpp"
 
+#include <limits>
+
 namespace Tungsten {
 
 class Ray
@@ -14,31 +16,23 @@ class Ray
     float _nearT;
     float _farT;
     float _time;
-    float _footprint;
-    float _diameter;
+    bool _primaryRay;
 
 public:
     Ray() = default;
 
-    Ray(const Vec3f &pos, const Vec3f &dir, float nearT = 1e-4f, float farT = 1e30f, float time = 0.0f)
-    : _pos(pos), _dir(dir), _nearT(nearT), _farT(farT), _time(time), _footprint(0.0f), _diameter(0.0f)
+    Ray(const Vec3f &pos, const Vec3f &dir, float nearT = 1e-4f, float farT = infinity(), float time = 0.0f)
+    : _pos(pos), _dir(dir), _nearT(nearT), _farT(farT), _time(time), _primaryRay(false)
     {
     }
 
-    Ray scatter(const Vec3f &newPos, const Vec3f &newDir, float newNearT, float pdf) const
+    Ray scatter(const Vec3f &newPos, const Vec3f &newDir, float newNearT, float newFarT = infinity()) const
     {
         Ray ray(*this);
         ray._pos = newPos;
         ray._dir = newDir;
         ray._nearT = newNearT;
-        ray._farT = 1e30f;
-        if (pdf > 0.0f) {
-            // Clamp solid angle to some arbitrary upper bound to remain conservative
-            float solidAngle = min(1.0f/pdf, PI);
-            float cosHalfApex = 1.0f - INV_TWO_PI*solidAngle;
-            float sinHalfApex = std::sqrt(max(1.0f - sqr(cosHalfApex), 0.0f));
-            ray._diameter = max(ray._diameter, 2.0f*sinHalfApex);
-        }
+        ray._farT = newFarT;
         return ray;
     }
 
@@ -97,29 +91,19 @@ public:
         _time = time;
     }
 
-    float footprint() const
+    bool isPrimaryRay() const
     {
-        return _footprint;
+        return _primaryRay;
     }
 
-    void setFootprint(float footprint)
+    void setPrimaryRay(bool value)
     {
-        _footprint = footprint;
+        _primaryRay = value;
     }
 
-    float diameter() const
+    static inline float infinity()
     {
-        return _diameter;
-    }
-
-    void setDiameter(float diameter)
-    {
-        _diameter = diameter;
-    }
-
-    void advanceFootprint()
-    {
-        _footprint += _farT*_diameter;
+        return std::numeric_limits<float>::infinity();
     }
 };
 

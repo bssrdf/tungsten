@@ -2,17 +2,12 @@
 #include "RoughConductorBsdf.hpp"
 #include "Fresnel.hpp"
 
-#include "sampling/UniformSampler.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 
+#include "io/JsonObject.hpp"
 #include "io/Scene.hpp"
 
 namespace Tungsten {
-
-void SmoothCoatBsdf::init()
-{
-    _scaledSigmaA = _thickness*_sigmaA;
-    _avgTransmittance = std::exp(-2.0f*_scaledSigmaA.avg());
-}
 
 SmoothCoatBsdf::SmoothCoatBsdf()
 : _ior(1.3f),
@@ -20,8 +15,6 @@ SmoothCoatBsdf::SmoothCoatBsdf()
   _sigmaA(0.0f),
   _substrate(std::make_shared<RoughConductorBsdf>())
 {
-    _lobes = BsdfLobes(BsdfLobes::SpecularReflectionLobe, _substrate->lobes());
-    init();
 }
 
 void SmoothCoatBsdf::fromJson(const rapidjson::Value &v, const Scene &scene)
@@ -29,26 +22,26 @@ void SmoothCoatBsdf::fromJson(const rapidjson::Value &v, const Scene &scene)
     Bsdf::fromJson(v, scene);
     JsonUtils::fromJson(v, "ior", _ior);
     JsonUtils::fromJson(v, "thickness", _thickness);
-    JsonUtils::fromJson(v, "sigmaA", _sigmaA);
+    JsonUtils::fromJson(v, "sigma_a", _sigmaA);
     _substrate = scene.fetchBsdf(JsonUtils::fetchMember(v, "substrate"));
-
-    _lobes = BsdfLobes(BsdfLobes::SpecularReflectionLobe, _substrate->lobes());
-    init();
 }
 
 rapidjson::Value SmoothCoatBsdf::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Bsdf::toJson(allocator);
-    v.AddMember("type", "smooth_coat", allocator);
-    v.AddMember("ior", _ior, allocator);
-    v.AddMember("thickness", _thickness, allocator);
-    v.AddMember("sigmaA", JsonUtils::toJsonValue(_sigmaA, allocator), allocator);
-    JsonUtils::addObjectMember(v, "substrate", *_substrate, allocator);
-    return std::move(v);
+    return JsonObject{Bsdf::toJson(allocator), allocator,
+        "type", "smooth_coat",
+        "ior", _ior,
+        "thickness", _thickness,
+        "sigma_a", _sigmaA,
+        "substrate", *_substrate
+    };
 }
 
 bool SmoothCoatBsdf::sample(SurfaceScatterEvent &event) const
 {
+    if (event.wi.z() <= 0.0f)
+        return false;
+
     bool sampleR = event.requestedLobe.test(BsdfLobes::SpecularReflectionLobe);
     bool sampleT = event.requestedLobe.test(_substrate->lobes());
 
@@ -63,12 +56,20 @@ bool SmoothCoatBsdf::sample(SurfaceScatterEvent &event) const
 
     float substrateWeight = _avgTransmittance*(1.0f - Fi);
     float specularWeight = Fi;
-    float specularProbability = specularWeight/(specularWeight + substrateWeight);
+    float specularProbability;
+    if (sampleR && sampleT)
+        specularProbability = specularWeight/(specularWeight + substrateWeight);
+    else if (sampleR)
+        specularProbability = 1.0f;
+    else if (sampleT)
+        specularProbability = 0.0f;
+    else
+        return false;
 
-    if (sampleR && (event.sampler->next1D() < specularProbability || !sampleT)) {
+    if (sampleR && event.sampler->nextBoolean(specularProbability)) {
         event.wo = Vec3f(-wi.x(), -wi.y(), wi.z());
-        event.pdf = 0.0f;
-        event.throughput = Vec3f(Fi/specularProbability);
+        event.pdf = specularProbability;
+        event.weight = Vec3f(Fi/specularProbability);
         event.sampledLobe = BsdfLobes::SpecularReflectionLobe;
     } else {
         Vec3f originalWi(wi);
@@ -85,16 +86,12 @@ bool SmoothCoatBsdf::sample(SurfaceScatterEvent &event) const
             return false;
         float cosThetaSubstrate = event.wo.z();
         event.wo = Vec3f(event.wo.x()*_ior, event.wo.y()*_ior, cosThetaTo);
-        event.throughput *= (1.0f - Fi)*(1.0f - Fo);
+        event.weight *= (1.0f - Fi)*(1.0f - Fo);
         if (_scaledSigmaA.max() > 0.0f)
-            event.throughput *= std::exp(_scaledSigmaA*(-1.0f/cosThetaSubstrate - 1.0f/cosThetaTi));
+            event.weight *= std::exp(_scaledSigmaA*(-1.0f/cosThetaSubstrate - 1.0f/cosThetaTi));
 
-        if (sampleR) {
-            event.pdf *= 1.0f - specularProbability;
-            event.throughput /= 1.0f - specularProbability;
-        }
-
-        event.throughput *= originalWi.z()/wiSubstrate.z();
+        event.weight /= 1.0f - specularProbability;
+        event.pdf *= 1.0f - specularProbability;
         event.pdf *= eta*eta*cosThetaTo/cosThetaSubstrate;
     }
 
@@ -103,10 +100,11 @@ bool SmoothCoatBsdf::sample(SurfaceScatterEvent &event) const
 
 Vec3f SmoothCoatBsdf::eval(const SurfaceScatterEvent &event) const
 {
-    bool sampleT = event.requestedLobe.test(_substrate->lobes());
-
-    if (!sampleT)
+    if (event.wi.z() <= 0.0f || event.wo.z() <= 0.0f)
         return Vec3f(0.0f);
+
+    bool evalR = event.requestedLobe.test(BsdfLobes::SpecularReflectionLobe);
+    bool evalT = event.requestedLobe.test(_substrate->lobes());
 
     const Vec3f &wi = event.wi;
     const Vec3f &wo = event.wo;
@@ -116,29 +114,32 @@ Vec3f SmoothCoatBsdf::eval(const SurfaceScatterEvent &event) const
     float Fi = Fresnel::dielectricReflectance(eta, wi.z(), cosThetaTi);
     float Fo = Fresnel::dielectricReflectance(eta, wo.z(), cosThetaTo);
 
-    if (Fi == 1.0f || Fo == 1.0f)
+    if (evalR && checkReflectionConstraint(event.wi, event.wo)) {
+        return Vec3f(Fi);
+    } else if (evalT) {
+        Vec3f wiSubstrate(wi.x()*eta, wi.y()*eta, std::copysign(cosThetaTi, wi.z()));
+        Vec3f woSubstrate(wo.x()*eta, wo.y()*eta, std::copysign(cosThetaTo, wo.z()));
+
+        float laplacian = eta*eta*wo.z()/cosThetaTo;
+
+        Vec3f substrateF = _substrate->eval(event.makeWarpedQuery(wiSubstrate, woSubstrate));
+
+        if (_scaledSigmaA.max() > 0.0f)
+            substrateF *= std::exp(_scaledSigmaA*(-1.0f/cosThetaTo - 1.0f/cosThetaTi));
+
+        return laplacian*(1.0f - Fi)*(1.0f - Fo)*substrateF;
+    } else {
         return Vec3f(0.0f);
-
-    Vec3f wiSubstrate(wi.x()*eta, wi.y()*eta, std::copysign(cosThetaTi, wi.z()));
-    Vec3f woSubstrate(wo.x()*eta, wo.y()*eta, std::copysign(cosThetaTo, wo.z()));
-
-    float laplacian = eta*eta*wi.z()*wo.z()/(cosThetaTi*cosThetaTo);
-
-    Vec3f substrateF = _substrate->eval(event.makeWarpedQuery(wiSubstrate, woSubstrate));
-
-    if (_scaledSigmaA.max() > 0.0f)
-        substrateF *= std::exp(_scaledSigmaA*(-1.0f/cosThetaTo - 1.0f/cosThetaTi));
-
-    return laplacian*(1.0f - Fi)*(1.0f - Fo)*substrateF;
+    }
 }
 
 float SmoothCoatBsdf::pdf(const SurfaceScatterEvent &event) const
 {
+    if (event.wi.z() <= 0.0f || event.wo.z() <= 0.0f)
+        return 0.0f;
+
     bool sampleR = event.requestedLobe.test(BsdfLobes::SpecularReflectionLobe);
     bool sampleT = event.requestedLobe.test(_substrate->lobes());
-
-    if (!sampleT)
-        return 0.0f;
 
     const Vec3f &wi = event.wi;
     const Vec3f &wo = event.wo;
@@ -146,23 +147,34 @@ float SmoothCoatBsdf::pdf(const SurfaceScatterEvent &event) const
 
     float cosThetaTi, cosThetaTo;
     float Fi = Fresnel::dielectricReflectance(eta, wi.z(), cosThetaTi);
-    float Fo = Fresnel::dielectricReflectance(eta, wo.z(), cosThetaTo);
-
-    if (Fi == 1.0f || Fo == 1.0f)
-        return 0.0f;
+    Fresnel::dielectricReflectance(eta, wo.z(), cosThetaTo);
 
     Vec3f wiSubstrate(wi.x()*eta, wi.y()*eta, std::copysign(cosThetaTi, wi.z()));
     Vec3f woSubstrate(wo.x()*eta, wo.y()*eta, std::copysign(cosThetaTo, wo.z()));
 
-    float pdf = _substrate->pdf(event.makeWarpedQuery(wiSubstrate, woSubstrate));
-    if (sampleR) {
+    if (sampleR && sampleT) {
         float substrateWeight = _avgTransmittance*(1.0f - Fi);
         float specularWeight = Fi;
         float specularProbability = specularWeight/(specularWeight + substrateWeight);
-        pdf *= (1.0f - specularProbability);
+        if (checkReflectionConstraint(event.wi, event.wo))
+            return specularProbability;
+        else
+            return _substrate->pdf(event.makeWarpedQuery(wiSubstrate, woSubstrate))
+                    *(1.0f - specularProbability)*eta*eta*std::abs(wo.z()/cosThetaTo);
+    } else if (sampleT) {
+        return _substrate->pdf(event.makeWarpedQuery(wiSubstrate, woSubstrate))*eta*eta*std::abs(wo.z()/cosThetaTo);
+    } else if (sampleR) {
+        return checkReflectionConstraint(event.wi, event.wo) ? 1.0f : 0.0f;
+    } else {
+        return 0.0f;
     }
-    pdf *= eta*eta*std::abs(wo.z()/cosThetaTo);
-    return pdf;
+}
+
+void SmoothCoatBsdf::prepareForRender()
+{
+    _scaledSigmaA = _thickness*_sigmaA;
+    _avgTransmittance = std::exp(-2.0f*_scaledSigmaA.avg());
+    _lobes = BsdfLobes(BsdfLobes::SpecularReflectionLobe, _substrate->lobes());
 }
 
 }

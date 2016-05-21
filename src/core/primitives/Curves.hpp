@@ -5,6 +5,8 @@
 
 #include "bvh/BinaryBvh.hpp"
 
+#include "io/Path.hpp"
+
 #include <memory>
 #include <vector>
 
@@ -23,9 +25,12 @@ class Curves : public Primitive
         MODE_RIBBON
     };
 
-    std::string _path;
-    std::string _dir;
+    PathPtr _path;
     std::string _modeString;
+    float _curveThickness;
+    float _subsample;
+    bool _overrideThickness;
+    bool _taperThickness;
 
     CurveMode _mode;
 
@@ -37,6 +42,7 @@ class Curves : public Primitive
     std::vector<Vec3f> _nodeColor;
     std::vector<Vec3f> _nodeNormals;
 
+    std::shared_ptr<Bsdf> _bsdf;
     std::shared_ptr<TriangleMesh> _proxy;
 
     Box3f _bounds;
@@ -56,9 +62,13 @@ public:
 
     Curves();
     Curves(const Curves &o);
+    Curves(std::vector<uint32> curveEnds, std::vector<Vec4f> nodeData, std::shared_ptr<Bsdf> bsdf, std::string name);
 
     virtual void fromJson(const rapidjson::Value &v, const Scene &scene) override;
     virtual rapidjson::Value toJson(Allocator &allocator) const override;
+
+    virtual void loadResources() override;
+    virtual void saveResources() override;
 
     virtual bool intersect(Ray &ray, IntersectionTemporary &data) const override;
     virtual bool occluded(const Ray &ray) const override;
@@ -68,26 +78,26 @@ public:
             Vec3f &T, Vec3f &B) const override;
 
     virtual bool isSamplable() const override;
-    virtual void makeSamplable() override;
-    virtual float inboundPdf(const IntersectionTemporary &data, const Vec3f &p, const Vec3f &d) const override;
-    virtual bool sampleInboundDirection(LightSample &sample) const override;
-    virtual bool sampleOutboundDirection(LightSample &sample) const override;
+    virtual void makeSamplable(const TraceableScene &scene, uint32 threadIndex) override;
+
     virtual bool invertParametrization(Vec2f uv, Vec3f &pos) const override;
 
-    virtual bool isDelta() const override;
+    virtual bool isDirac() const override;
     virtual bool isInfinite() const override;
 
-    virtual float approximateRadiance(const Vec3f &p) const override;
+    virtual float approximateRadiance(uint32 threadIndex, const Vec3f &p) const override;
     virtual Box3f bounds() const override;
 
     virtual const TriangleMesh &asTriangleMesh() override;
 
     virtual void prepareForRender() override;
-    virtual void cleanupAfterRender() override;
+    virtual void teardownAfterRender() override;
+
+    virtual int numBsdfs() const override;
+    virtual std::shared_ptr<Bsdf> &bsdf(int index) override;
+    virtual void setBsdf(int index, std::shared_ptr<Bsdf> &bsdf) override;
 
     virtual Primitive *clone() override;
-
-    virtual void saveData() override;
 };
 
 }

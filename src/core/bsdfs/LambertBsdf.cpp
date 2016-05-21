@@ -2,15 +2,13 @@
 
 #include "samplerecords/SurfaceScatterEvent.hpp"
 
-#include "sampling/SampleGenerator.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 #include "sampling/SampleWarp.hpp"
 
 #include "math/Angle.hpp"
 #include "math/Vec.hpp"
 
-#include "io/JsonUtils.hpp"
-
-#include <rapidjson/document.h>
+#include "io/JsonObject.hpp"
 
 namespace Tungsten {
 
@@ -21,9 +19,9 @@ LambertBsdf::LambertBsdf()
 
 rapidjson::Value LambertBsdf::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Bsdf::toJson(allocator);
-    v.AddMember("type", "lambert", allocator);
-    return std::move(v);
+    return JsonObject{Bsdf::toJson(allocator), allocator,
+        "type", "lambert"
+    };
 }
 
 bool LambertBsdf::sample(SurfaceScatterEvent &event) const
@@ -34,7 +32,7 @@ bool LambertBsdf::sample(SurfaceScatterEvent &event) const
         return false;
     event.wo  = SampleWarp::cosineHemisphere(event.sampler->next2D());
     event.pdf = SampleWarp::cosineHemispherePdf(event.wo);
-    event.throughput = albedo(event.info);
+    event.weight = albedo(event.info);
     event.sampledLobe = BsdfLobes::DiffuseReflectionLobe;
     return true;
 }

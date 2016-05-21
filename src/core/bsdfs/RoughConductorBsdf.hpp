@@ -16,7 +16,7 @@ class RoughConductorBsdf : public Bsdf
 
     Microfacet::Distribution _distribution;
 
-    void init();
+    void lookupMaterial();
 
 public:
     RoughConductorBsdf();
@@ -28,20 +28,57 @@ public:
     virtual Vec3f eval(const SurfaceScatterEvent &event) const override;
     virtual float pdf(const SurfaceScatterEvent &event) const override;
 
-    const Vec3f& eta() const {
+    virtual void prepareForRender() override;
+
+    const std::string &distributionName() const
+    {
+        return _distributionName;
+    }
+
+    Vec3f eta() const
+    {
         return _eta;
     }
 
-    const Vec3f& k() const {
+    Vec3f k() const
+    {
         return _k;
     }
 
-    const std::shared_ptr<Texture> &roughness() const {
+    const std::string &materialName() const
+    {
+        return _materialName;
+    }
+
+    const std::shared_ptr<Texture> &roughness() const
+    {
         return _roughness;
     }
 
-    const std::string &distributionName() const {
-        return _distributionName;
+    void setDistributionName(const std::string &distributionName)
+    {
+        _distributionName = distributionName;
+    }
+
+    void setEta(Vec3f eta)
+    {
+        _eta = eta;
+    }
+
+    void setK(Vec3f k)
+    {
+        _k = k;
+    }
+
+    void setMaterialName(const std::string &materialName)
+    {
+        _materialName = materialName;
+        lookupMaterial();
+    }
+
+    void setRoughness(const std::shared_ptr<Texture> &roughness)
+    {
+        _roughness = roughness;
     }
 };
 

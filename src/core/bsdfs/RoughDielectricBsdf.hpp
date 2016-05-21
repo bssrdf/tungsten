@@ -12,14 +12,12 @@ class RoughDielectricBsdf : public Bsdf
 
     std::shared_ptr<Texture> _roughness;
     float _ior;
+    float _invIor;
     bool _enableT;
 
     Microfacet::Distribution _distribution;
 
-    void init();
-
 public:
-
     RoughDielectricBsdf();
 
     virtual void fromJson(const rapidjson::Value &v, const Scene &scene) override;
@@ -37,9 +35,23 @@ public:
     virtual bool sample(SurfaceScatterEvent &event) const override;
     virtual Vec3f eval(const SurfaceScatterEvent &event) const override;
     virtual float pdf(const SurfaceScatterEvent &event) const override;
+    virtual float eta(const SurfaceScatterEvent &event) const override;
 
-    float ior() const {
+    virtual void prepareForRender() override;
+
+    const std::string &distributionName() const
+    {
+        return _distributionName;
+    }
+
+    float ior() const
+    {
         return _ior;
+    }
+
+    bool enableTransmission() const
+    {
+        return _enableT;
     }
 
     const std::shared_ptr<Texture> &roughness() const
@@ -47,9 +59,24 @@ public:
         return _roughness;
     }
 
-    const std::string &distributionName() const
+    void setDistributionName(const std::string &distributionName)
     {
-        return _distributionName;
+        _distributionName = distributionName;
+    }
+
+    void setIor(float ior)
+    {
+        _ior = ior;
+    }
+
+    void setRoughness(const std::shared_ptr<Texture> &roughness)
+    {
+        _roughness = roughness;
+    }
+
+    void setEnableTransmission(bool enableTransmission)
+    {
+        _enableT = enableTransmission;
     }
 };
 

@@ -7,6 +7,8 @@
 
 #include "sampling/Distribution1D.hpp"
 
+#include "io/Path.hpp"
+
 #include <embree/include/embree.h>
 #include <memory>
 #include <vector>
@@ -18,15 +20,20 @@ class Scene;
 
 class TriangleMesh : public Primitive
 {
-    std::string _path;
+    PathPtr _path;
     bool _smoothed;
+    bool _backfaceCulling;
+    bool _recomputeNormals;
 
     std::vector<Vertex> _verts;
     std::vector<Vertex> _tfVerts;
     std::vector<TriangleI> _tris;
 
+    std::vector<std::shared_ptr<Bsdf>> _bsdfs;
+
     std::unique_ptr<Distribution1D> _triSampler;
     float _totalArea;
+    float _invArea;
 
     Box3f _bounds;
 
@@ -37,21 +44,30 @@ class TriangleMesh : public Primitive
     Vec3f normalAt(int triangle, float u, float v) const;
     Vec2f uvAt(int triangle, float u, float v) const;
 
+protected:
+    virtual float powerToRadianceFactor() const override;
+
 public:
     TriangleMesh();
     TriangleMesh(const TriangleMesh &o);
     TriangleMesh(std::vector<Vertex> verts, std::vector<TriangleI> tris,
                  const std::shared_ptr<Bsdf> &bsdf,
-                 const std::string &name, bool smoothed);
+                 const std::string &name, bool smoothed, bool backfaceCull);
+    TriangleMesh(std::vector<Vertex> verts, std::vector<TriangleI> tris,
+                 std::vector<std::shared_ptr<Bsdf>> bsdf,
+                 const std::string &name, bool smoothed, bool backfaceCull);
 
     virtual void fromJson(const rapidjson::Value &v, const Scene &scene) override;
     virtual rapidjson::Value toJson(Allocator &allocator) const override;
 
-    virtual void saveData() override;
-    void saveAsObj(const std::string &path) const;
+    virtual void loadResources() override;
+    virtual void saveResources() override;
+
+    void saveAsObj(const Path &path) const;
     void calcSmoothVertexNormals();
     void computeBounds();
 
+    void makeCube();
     void makeSphere(float radius);
     void makeCone(float radius, float height);
 
@@ -65,21 +81,36 @@ public:
     virtual const TriangleMesh &asTriangleMesh() override;
 
     virtual bool isSamplable() const override;
-    virtual void makeSamplable() override;
+    virtual void makeSamplable(const TraceableScene &scene, uint32 threadIndex) override;
 
-    virtual float inboundPdf(const IntersectionTemporary &data, const Vec3f &p, const Vec3f &d) const override;
-    virtual bool sampleInboundDirection(LightSample &sample) const override;
-    virtual bool sampleOutboundDirection(LightSample &sample) const override;
-    virtual bool invertParametrization(Vec2f /*uv*/, Vec3f &/*pos*/) const override;
+    virtual bool samplePosition(PathSampleGenerator &sampler, PositionSample &sample) const override final;
+    virtual bool sampleDirection(PathSampleGenerator &sampler, const PositionSample &point,
+            DirectionSample &sample) const override final;
+    virtual bool sampleDirect(uint32 threadIndex, const Vec3f &p, PathSampleGenerator &sampler,
+            LightSample &sample) const override;
+    virtual float positionalPdf(const PositionSample &point) const;
+    virtual float directionalPdf(const PositionSample &point, const DirectionSample &sample) const override;
+    virtual float directPdf(uint32 threadIndex, const IntersectionTemporary &data,
+            const IntersectionInfo &info, const Vec3f &p) const override;
+    virtual Vec3f evalPositionalEmission(const PositionSample &sample) const override;
+    virtual Vec3f evalDirectionalEmission(const PositionSample &point,
+            const DirectionSample &sample) const override;
+    virtual Vec3f evalDirect(const IntersectionTemporary &data, const IntersectionInfo &info) const override;
 
-    virtual bool isDelta() const override;
+    virtual bool invertParametrization(Vec2f uv, Vec3f &pos) const override;
+
+    virtual bool isDirac() const override;
     virtual bool isInfinite() const override;
 
-    virtual float approximateRadiance(const Vec3f &/*p*/) const override;
+    virtual float approximateRadiance(uint32 threadIndex, const Vec3f &p) const override;
     virtual Box3f bounds() const override;
 
     virtual void prepareForRender() override;
-    virtual void cleanupAfterRender() override;
+    virtual void teardownAfterRender() override;
+
+    virtual int numBsdfs() const override;
+    virtual std::shared_ptr<Bsdf> &bsdf(int index) override;
+    virtual void setBsdf(int index, std::shared_ptr<Bsdf> &bsdf) override;
 
     virtual Primitive *clone() override;
 
@@ -113,7 +144,7 @@ public:
         _smoothed = v;
     }
 
-    const std::string& path() const
+    const PathPtr& path() const
     {
         return _path;
     }

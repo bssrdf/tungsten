@@ -2,16 +2,14 @@
 
 #include "samplerecords/SurfaceScatterEvent.hpp"
 
-#include "sampling/SampleGenerator.hpp"
+#include "sampling/PathSampleGenerator.hpp"
 #include "sampling/SampleWarp.hpp"
 
 #include "math/TangentFrame.hpp"
 #include "math/Angle.hpp"
 #include "math/Vec.hpp"
 
-#include "io/JsonUtils.hpp"
-
-#include <rapidjson/document.h>
+#include "io/JsonObject.hpp"
 
 namespace Tungsten {
 
@@ -19,15 +17,6 @@ PhongBsdf::PhongBsdf(float exponent, float diffuseRatio)
 : _exponent(exponent),
   _diffuseRatio(diffuseRatio)
 {
-    init();
-}
-
-void PhongBsdf::init()
-{
-    _lobes       = BsdfLobes(BsdfLobes::GlossyReflectionLobe);
-    _invExponent = 1.0f/(1.0f + _exponent);
-    _pdfFactor   = (_exponent + 1.0f)*INV_TWO_PI;
-    _brdfFactor  = (_exponent + 2.0f)*INV_TWO_PI;
 }
 
 void PhongBsdf::fromJson(const rapidjson::Value &v, const Scene &scene)
@@ -35,16 +24,15 @@ void PhongBsdf::fromJson(const rapidjson::Value &v, const Scene &scene)
     Bsdf::fromJson(v, scene);
     JsonUtils::fromJson(v, "exponent", _exponent);
     JsonUtils::fromJson(v, "diffuse_ratio", _diffuseRatio);
-    init();
 }
 
 rapidjson::Value PhongBsdf::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Bsdf::toJson(allocator);
-    v.AddMember("type", "phong", allocator);
-    v.AddMember("exponent", _exponent, allocator);
-    v.AddMember("diffuse_ratio", _diffuseRatio, allocator);
-    return std::move(v);
+    return JsonObject{Bsdf::toJson(allocator), allocator,
+        "type", "phong",
+        "exponent", _exponent,
+        "diffuse_ratio", _diffuseRatio
+    };
 }
 
 bool PhongBsdf::sample(SurfaceScatterEvent &event) const
@@ -58,8 +46,8 @@ bool PhongBsdf::sample(SurfaceScatterEvent &event) const
         return false;
 
     bool sampleGlossy;
-    if (evalGlossy & evalDiffuse)
-        sampleGlossy = event.sampler->next1D() >= _diffuseRatio;
+    if (evalGlossy && evalDiffuse)
+        sampleGlossy = event.sampler->nextBoolean(1.0f - _diffuseRatio);
     else
         sampleGlossy = evalGlossy;
 
@@ -83,7 +71,7 @@ bool PhongBsdf::sample(SurfaceScatterEvent &event) const
     }
 
     event.pdf = pdf(event);
-    event.throughput = eval(event)/event.pdf;
+    event.weight = eval(event)/event.pdf;
 
     return true;
 }
@@ -100,7 +88,7 @@ Vec3f PhongBsdf::eval(const SurfaceScatterEvent &event) const
 
     float result = 0.0f;
     if (evalDiffuse)
-        result += _diffuseRatio;
+        result += _diffuseRatio*INV_PI;
     if (evalGlossy) {
         float cosTheta = Vec3f(-event.wi.x(), -event.wi.y(), event.wi.z()).dot(event.wo);
         if (cosTheta > 0.0f)
@@ -132,6 +120,14 @@ float PhongBsdf::pdf(const SurfaceScatterEvent &event) const
         result = SampleWarp::cosineHemispherePdf(event.wo);
 
     return result;
+}
+
+void PhongBsdf::prepareForRender()
+{
+    _lobes       = BsdfLobes(BsdfLobes::GlossyReflectionLobe | BsdfLobes::DiffuseReflectionLobe);
+    _invExponent = 1.0f/(1.0f + _exponent);
+    _pdfFactor   = (_exponent + 1.0f)*INV_TWO_PI;
+    _brdfFactor  = (_exponent + 2.0f)*INV_TWO_PI;
 }
 
 }

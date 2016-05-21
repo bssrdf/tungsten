@@ -5,21 +5,14 @@
 
 namespace Tungsten {
 
-class SampleGenerator;
+class Medium;
 
 struct LightSample
 {
-    SampleGenerator *sampler;
-    Vec3f p;
-
     Vec3f d;
     float dist;
     float pdf;
-
-    LightSample(SampleGenerator *sampler_, const Vec3f &p_)
-    : sampler(sampler_), p(p_)
-    {
-    }
+    const Medium *medium;
 };
 
 }

@@ -3,36 +3,40 @@
 
 #include "ImageIO.hpp"
 
+#include <rapidjson/document.h>
+#include <functional>
 #include <utility>
 #include <memory>
 #include <string>
-#include <map>
+#include <set>
 
 namespace Tungsten {
 
 class BitmapTexture;
+class IesTexture;
+class Scene;
 
 class TextureCache
 {
-    typedef std::pair<std::string, TexelConversion> KeyType;
+    typedef std::shared_ptr<BitmapTexture> BitmapKeyType;
+    typedef std::shared_ptr<IesTexture> IesKeyType;
 
-    std::map<KeyType, std::shared_ptr<BitmapTexture>> _textures;
+    std::set<BitmapKeyType, std::function<bool(const BitmapKeyType &, const BitmapKeyType &)>> _textures;
+    std::set<IesKeyType, std::function<bool(const IesKeyType &, const IesKeyType &)>> _iesTextures;
+
 public:
-    TextureCache() = default;
+    TextureCache();
 
-    std::shared_ptr<BitmapTexture> &fetchTexture(const std::string &path, TexelConversion conversion);
+    std::shared_ptr<BitmapTexture> fetchTexture(const rapidjson::Value &value, TexelConversion conversion,
+            const Scene *scene);
+    std::shared_ptr<BitmapTexture> fetchTexture(PathPtr path, TexelConversion conversion,
+            bool gammaCorrect = true, bool linear = true, bool clamp = false);
 
+    std::shared_ptr<IesTexture> fetchIesTexture(const rapidjson::Value &value, const Scene *scene);
+    std::shared_ptr<IesTexture> fetchIesTexture(PathPtr path, int resolution);
+
+    void loadResources();
     void prune();
-
-    const std::map<KeyType, std::shared_ptr<BitmapTexture>> &textures() const
-    {
-        return _textures;
-    }
-
-    std::map<KeyType, std::shared_ptr<BitmapTexture>> &textures()
-    {
-        return _textures;
-    }
 };
 
 }

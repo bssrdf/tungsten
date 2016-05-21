@@ -11,6 +11,7 @@ class BladeTexture : public Texture
 
     int _numBlades;
     float _angle;
+    Vec3f _value;
 
     float _area;
     float _bladeAngle;
@@ -31,12 +32,30 @@ public:
     virtual Vec3f minimum() const override;
     virtual Vec3f maximum() const override;
 
-    virtual Vec3f operator[](const Vec2f &uv) const override;
+    virtual Vec3f operator[](const Vec2f &uv) const override final;
+    virtual Vec3f operator[](const IntersectionInfo &info) const override;
     virtual void derivatives(const Vec2f &uv, Vec2f &derivs) const override;
 
     virtual void makeSamplable(TextureMapJacobian jacobian) override;
     virtual Vec2f sample(TextureMapJacobian jacobian, const Vec2f &uv) const override;
     virtual float pdf(TextureMapJacobian jacobian, const Vec2f &uv) const override;
+
+    virtual void scaleValues(float factor) override;
+
+    virtual Texture *clone() const override;
+
+    float angle() const
+    {
+        return _angle;
+    }
+
+    int numBlades() const
+    {
+        return _numBlades;
+    }
+
+    void setAngle(float angle);
+    void setNumBlades(int numBlades);
 };
 
 }

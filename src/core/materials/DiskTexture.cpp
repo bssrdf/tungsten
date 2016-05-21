@@ -1,16 +1,31 @@
 #include "DiskTexture.hpp"
 
+#include "primitives/IntersectionInfo.hpp"
+
 #include "sampling/SampleWarp.hpp"
 
 #include "math/MathUtil.hpp"
 
+#include "io/JsonObject.hpp"
+
 namespace Tungsten {
+
+DiskTexture::DiskTexture()
+: _value(1.0f)
+{
+}
+
+void DiskTexture::fromJson(const rapidjson::Value &v, const Scene &/*scene*/)
+{
+    scalarOrVecFromJson(v, "value", _value);
+}
 
 rapidjson::Value DiskTexture::toJson(Allocator &allocator) const
 {
-    rapidjson::Value v = Texture::toJson(allocator);
-    v.AddMember("type", "disk", allocator);
-    return std::move(v);
+    return JsonObject{Texture::toJson(allocator), allocator,
+        "type", "disk",
+        "value",  scalarOrVecToJson( _value, allocator)
+    };
 }
 
 bool DiskTexture::isConstant() const
@@ -20,7 +35,7 @@ bool DiskTexture::isConstant() const
 
 Vec3f DiskTexture::average() const
 {
-    return Vec3f(PI*0.25f);
+    return PI*0.25f*_value;
 }
 
 Vec3f DiskTexture::minimum() const
@@ -30,12 +45,17 @@ Vec3f DiskTexture::minimum() const
 
 Vec3f DiskTexture::maximum() const
 {
-    return Vec3f(1.0f);
+    return _value;
 }
 
 Vec3f DiskTexture::operator[](const Vec<float, 2> &uv) const
 {
-    return (uv - Vec2f(0.5f)).lengthSq() < 0.25f ? Vec3f(1.0f) : Vec3f(0.0f);
+    return (uv - Vec2f(0.5f)).lengthSq() < 0.25f ? _value : Vec3f(0.0f);
+}
+
+Vec3f DiskTexture::operator[](const IntersectionInfo &info) const
+{
+    return (*this)[info.uv];
 }
 
 void DiskTexture::derivatives(const Vec2f &/*uv*/, Vec2f &derivs) const
@@ -55,6 +75,16 @@ Vec2f DiskTexture::sample(TextureMapJacobian /*jacobian*/, const Vec2f &uv) cons
 float DiskTexture::pdf(TextureMapJacobian /*jacobian*/, const Vec2f &uv) const
 {
     return (uv - Vec2f(0.5f)).lengthSq() < 0.25f ? SampleWarp::uniformDiskPdf()*4.0f : 0.0f;
+}
+
+void DiskTexture::scaleValues(float factor)
+{
+    _value *= factor;
+}
+
+Texture *DiskTexture::clone() const
+{
+    return new DiskTexture(*this);
 }
 
 }
